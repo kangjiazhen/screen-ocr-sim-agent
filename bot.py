@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人 v26
+微信智能机器人 v27
 ========================================
-基于 v25 的文字扫描定位 + 红点检测触发 + Coze AI
+基于 v26 升级：多红点并发 + 同聊多轮处理
 升级：
-  - OCR 引擎 Tesseract → PaddleOCR（PP-OCRv5 模型，enable_mkldnn=False 规避 3.3.x PIR/oneDNN BUG）
-  - PaddleOCR 启动预加载（首条消息无需等待）
-  - 红点检测 v3 扩大扫描范围 + 双模式颜色检测
-  - Coze API v3 三步流程（chat → retrieve → message/list）
-  - 配置抽离到 config.py
+  - Y轴聚类检测 → 多个未读会话逐个击破，不再平均取点
+  - stall 跟踪去重 → 点击无消息则计数，3次后跳过，不受置顶Y偏移影响
+  - 同聊多轮扫描 → 同一聊天内多人同时提问，最多4轮逐一处理
+  - 轮次计数器 → 每次处理完一轮红点后统一报告
 保留：
+  - PaddleOCR（PP-OCRv5，enable_mkldnn=False）
   - PrintWindow(PW_RENDERFULLCONTENT) 支持微信4.x GPU渲染
   - 动态消息定位（像素行扫描 + 百分比坐标）
   - 图像 hash 变化检测去重
   - 唤醒词正则过滤
+  - Coze API v3 三步流程（chat → retrieve → message/list）
+  - 配置抽离到 config.py
 ========================================
 """
 import sys
@@ -131,7 +133,6 @@ def capture_window(hwnd):
     bmp = win32ui.CreateBitmap()
     bmp.CreateCompatibleBitmap(mfc_dc, w, h)
     save_dc.SelectObject(bmp)
-    # ★ 关键：第3参数 = 2 (PW_RENDERFULLCONTENT)
     ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
     info = bmp.GetInfo()
     bits = bmp.GetBitmapBits(True)
@@ -144,14 +145,13 @@ def capture_window(hwnd):
     return img
 
 
-# ==================== 红点检测（v3：适配企业微信 + 多色系） ====================
-def find_red_dot(hwnd):
-    """扫描左侧聊天列表区，检测未读消息标记（红点/数字徽章）"""
+# ==================== 红点检测 v4：Y轴聚类 → 逐个击破 ====================
+def find_red_dot_clusters(hwnd):
+    """扫描聊天列表，按Y轴聚类红像素，返回 [(center_x, center_y, pixel_count), ...] 自上而下排序"""
     try:
         l, t, r, b = win32gui.GetWindowRect(hwnd)
         w = r - l
         h = b - t
-        # 聊天列表区：左侧 0~50% 宽度，顶部 12%~88% 高度
         scan_l = l + int(w * 0.04)
         scan_t = t + int(h * 0.12)
         scan_r = l + int(w * 0.50)
@@ -164,34 +164,75 @@ def find_red_dot(hwnd):
         for y in range(0, sh, 2):
             for x in range(0, sw, 2):
                 r_pix, g_pix, b_pix = screenshot.getpixel((x, y))
-                # 模式1：纯红/粉红（未读红点） R主导，G和B明显低
-                # 模式2：暗红徽章（数字背景） R>130，G和B都较低
                 is_red_dot = (r_pix > 160 and g_pix < r_pix * 0.55 and b_pix < r_pix * 0.55)
                 is_badge = (r_pix > 130 and g_pix < 100 and b_pix < 100 and r_pix > g_pix + 40)
                 if is_red_dot or is_badge:
                     red_pixels.append((scan_l + x, scan_t + y))
-        logging.info(f"[红点扫描] 区域={region_w}x{region_h}  红/徽章像素数={len(red_pixels)}")
-        if len(red_pixels) > 2:
-            avg_x = sum(p[0] for p in red_pixels) // len(red_pixels)
-            avg_y = sum(p[1] for p in red_pixels) // len(red_pixels)
-            logging.info(f"[红点] 检测到 @ ({avg_x}, {avg_y}) 共{len(red_pixels)}像素")
-            return avg_x, avg_y
-        else:
-            logging.info(f"[红点] 未检测到（仅{len(red_pixels)}像素）")
+
+        total = len(red_pixels)
+        logging.info(f"[红点扫描] 区域={region_w}x{region_h}  总红像素={total}")
+
+        if total <= 2:
+            logging.info(f"[红点] 未检测到（仅{total}像素）")
+            return []
+
+        # 按 Y 排序
+        red_pixels.sort(key=lambda p: p[1])
+
+        # Y轴聚类：相邻像素 Y 间距 ≤ 25px 归为同一簇
+        clusters = []
+        current_cluster = [red_pixels[0]]
+        for i in range(1, len(red_pixels)):
+            if red_pixels[i][1] - red_pixels[i - 1][1] <= 25:
+                current_cluster.append(red_pixels[i])
+            else:
+                if len(current_cluster) > 2:
+                    clusters.append(current_cluster)
+                current_cluster = [red_pixels[i]]
+        if len(current_cluster) > 2:
+            clusters.append(current_cluster)
+
+        if not clusters:
+            logging.info("[红点] 聚类后无有效簇")
+            return []
+
+        # 计算每个簇的中心
+        result = []
+        for ci, c in enumerate(clusters):
+            avg_x = sum(p[0] for p in c) // len(c)
+            avg_y = sum(p[1] for p in c) // len(c)
+            result.append((avg_x, avg_y, len(c)))
+            logging.info(f"  [红点簇{ci+1}] 中心=({avg_x},{avg_y})  像素={len(c)}  Y范围={c[0][1]}~{c[-1][1]}")
+
+        logging.info(f"[红点] 检测到 {len(result)} 个未读会话")
+        return result
+
     except Exception as e:
         logging.error(f"[红点] 扫描异常: {e}")
-    return None
+    return []
 
 
-def click_red_dot(hwnd):
-    pos = find_red_dot(hwnd)
-    if pos:
-        pyautogui.moveTo(pos, duration=0.1)
+def click_red_dot(hwnd, stall_tracker):
+    """点击最顶部的红点簇。stall_tracker 记录每个Y位置连续无新消息次数"""
+    clusters = find_red_dot_clusters(hwnd)
+    if not clusters:
+        return False, None
+
+    for cx, cy, pc in clusters:
+        # 检查该位置是否已连续多次无新消息
+        stall_count = stall_tracker.get(cy, 0)
+        if stall_count >= 3:
+            logging.info(f"[红点] 跳过簇 ({cx},{cy}) —— 已连续{stall_count}次无新消息")
+            continue
+
+        pyautogui.moveTo(cx, cy, duration=0.1)
         pyautogui.click()
-        logging.info(f"[红点] 点击成功: {pos}")
+        logging.info(f"[红点] 点击簇 ({cx}, {cy}) 像素={pc}  stall={stall_count}")
         time.sleep(0.8)
-        return True
-    return False
+        return True, cy
+
+    logging.info("[红点] 所有簇均处于stall状态，跳过")
+    return False, None
 
 
 def click_first_chat(hwnd):
@@ -207,7 +248,7 @@ def click_first_chat(hwnd):
     return True
 
 
-# ==================== 动态定位最新气泡（v24方案） ====================
+# ==================== 动态定位最新气泡 ====================
 def snap_hash(hwnd):
     """截取聊天记录区域，返回 MD5 hash。用于检测消息变化"""
     img = capture_window(hwnd)
@@ -223,22 +264,17 @@ def get_latest_bubble_text(hwnd):
     arr = np.array(img)
     logging.info(f"  [OCR] 窗口尺寸: {w}x{h}")
 
-    # 聊天记录区 Y 范围（6% ~ 85%）
     chat_y1 = int(h * 0.06)
     chat_y2 = int(h * 0.85)
-
-    # 对方气泡文字列扫描范围（参考：头像~40px+昵称，0.40跳过头像，0.77覆盖文字最右）
     text_x1 = int(w * 0.40)
     text_x2 = int(w * 0.77)
 
     region = arr[chat_y1:chat_y2, text_x1:text_x2]
     rh = region.shape[0]
 
-    # 深色文字检测（R,G,B均<80）
     dark = (region[:, :, 0] < 80) & (region[:, :, 1] < 80) & (region[:, :, 2] < 80)
     row_dark = dark.sum(axis=1)
 
-    # 从底部向上找第一条有文字的行
     bottom_y = -1
     for yi in range(rh - 1, -1, -1):
         if row_dark[yi] > 2:
@@ -249,7 +285,6 @@ def get_latest_bubble_text(hwnd):
         logging.info("[OCR] 未找到对方文字行")
         return ""
 
-    # 向上找气泡顶（连续15行无文字则认为是气泡顶部）
     top_y = bottom_y
     gap = 0
     for yi in range(bottom_y, max(bottom_y - 800, -1), -1):
@@ -261,10 +296,9 @@ def get_latest_bubble_text(hwnd):
             if gap >= 15:
                 break
 
-    # 裁剪坐标（留内边距）
     crop_y1 = chat_y1 + max(top_y - 15, 0)
     crop_y2 = chat_y1 + bottom_y + 20
-    crop_x1 = int(w * 0.40)   # 跳过头像
+    crop_x1 = int(w * 0.40)
     crop_x2 = int(w * 0.79)
 
     crop_h = crop_y2 - crop_y1
@@ -277,8 +311,6 @@ def get_latest_bubble_text(hwnd):
         crop_h = 400
 
     crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-
-    # PaddleOCR 直接识别（无需手动放大/对比度增强，模型自带预处理）
     crop_arr = np.array(crop)
     try:
         if _ocr is None:
@@ -307,10 +339,8 @@ def get_latest_bubble_text(hwnd):
                 logging.info(f"  [OCR] 片段: 「{text}」 置信度={conf:.2f}")
 
     raw = "\n".join(lines)
-
     logging.info(f"  [OCR] 原始输出: 「{raw[:80]}...」" if len(raw) > 80 else f"  [OCR] 原始输出: 「{raw}」")
 
-    # 后处理：参考v24
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     clean = []
     for ln in lines:
@@ -343,9 +373,6 @@ def get_latest_bubble_text(hwnd):
     result = " ".join(merged).strip()
     result = re.sub(r'\s+', ' ', result)
     result = re.sub(r'[》《|丨]{1,3}', '', result).strip()
-
-    # ★ 合并 CJK 字符间空格：OCR 常把 "机器人" 识别成 "机 器 人"
-    #   ". @ 机 器 人 你 好 2" → ". @机器人你好2"
     result = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', result)
     result = re.sub(r'@\s+(?=[\u4e00-\u9fff])', '@', result)
 
@@ -366,7 +393,6 @@ def coze_reply(content):
         "additional_messages": [{"role": "user", "content": content, "content_type": "text"}]
     }
     try:
-        # Step 1: 发起对话
         resp = requests.post(COZE_CHAT_URL, headers=headers, json=payload, timeout=COZE_TIMEOUT)
         logging.info(f"[Coze] POST 状态码: {resp.status_code}")
         if resp.status_code != 200:
@@ -382,7 +408,6 @@ def coze_reply(content):
         conv_id = data["data"]["conversation_id"]
         logging.info(f"[Coze] chat_id={chat_id[:20]}... 开始轮询")
 
-        # Step 2: 轮询等待对话完成
         for attempt in range(COZE_POLL_MAX):
             time.sleep(2)
             r = requests.get(COZE_RETRIEVE_URL, headers=headers,
@@ -403,7 +428,6 @@ def coze_reply(content):
             logging.warning("[Coze] 轮询超时")
             return None
 
-        # Step 3: 获取消息列表（真正包含回复内容的端点）
         logging.info(f"[Coze] 对话完成，获取消息列表...")
         r = requests.get(COZE_MESSAGE_LIST_URL, headers=headers,
                          params={"chat_id": chat_id, "conversation_id": conv_id}, timeout=COZE_TIMEOUT)
@@ -452,7 +476,6 @@ def send_message(hwnd, text):
     ensure_visible(hwnd)
     l, t, r, b = get_rect(hwnd)
     w, h = r - l, b - t
-    # 输入框点击点：宽度60%，高度88%
     input_x = l + int(w * 0.60)
     input_y = t + int(h * 0.88)
 
@@ -466,16 +489,51 @@ def send_message(hwnd, text):
     pyautogui.press('enter')
     time.sleep(0.35)
 
-    # 保持窗口在前
     ctypes.windll.user32.SetForegroundWindow(hwnd)
     time.sleep(0.2)
 
 
 def back_to_chat_list(hwnd):
-    """点击左侧空白回退到列表（可选）"""
+    """点击左侧空白回退到列表"""
     l, t, _, _ = get_rect(hwnd)
     pyautogui.click(l + 80, t + 150)
     time.sleep(0.5)
+
+
+# ==================== 单条消息处理 ====================
+def process_one_message(hwnd, last_msg_hash):
+    """进入聊天后，OCR识别 + 回复。返回 (是否成功, 新msg_hash)"""
+    time.sleep(0.8)
+    pyautogui.press('end')
+    time.sleep(0.6)
+
+    msg = get_latest_bubble_text(hwnd)
+    if not msg:
+        logging.info("[处理] 未识别到消息")
+        return False, last_msg_hash
+
+    logging.info(f"📩 收到消息: {msg}")
+
+    # 文字去重（同一会话内，相同消息不重复回复）
+    mh = hashlib.md5(msg.encode()).hexdigest()[:8]
+    if mh == last_msg_hash:
+        logging.info("[去重] 当前会话消息重复，跳过")
+        return False, last_msg_hash
+
+    if WAKE_WORD in msg:
+        question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip()
+        if not question:
+            question = "你好"
+        logging.info(f"[触发] 唤醒词匹配，提问: {question}")
+        reply = coze_reply(question)
+        if reply:
+            send_message(hwnd, reply)
+        else:
+            send_message(hwnd, "抱歉，暂时无法回答")
+        return True, mh
+    else:
+        logging.info("[跳过] 未包含唤醒词")
+        return False, last_msg_hash
 
 
 # ==================== 主循环 ====================
@@ -490,11 +548,17 @@ def main():
     pyautogui.PAUSE = 0.2
     pyautogui.FAILSAFE = False
 
+    stall_tracker = {}
     last_msg_hash = ""
     last_snap_hash = ""
     no_red_dot_count = 0
+    total_processed = 0
+
+    SAME_CHAT_MAX_PASS = 4
+
     logging.info(f"🤖 机器人启动，唤醒词: {WAKE_WORD}")
     logging.info("📱 窗口保持可见，按 '-' 退出程序")
+    logging.info("🔴 多红点模式：Y轴聚类 → 同聊多轮 → 逐个击破")
 
     while True:
         if KEYBOARD_AVAILABLE and keyboard.is_pressed('-'):
@@ -503,8 +567,8 @@ def main():
 
         ensure_visible(hwnd)
 
-        # 红点检测：有红点则进入对应聊天
-        clicked = click_red_dot(hwnd)
+        # ======== 红点检测：聚类 → 点最顶部的 ========
+        clicked, clicked_y = click_red_dot(hwnd, stall_tracker)
         if not clicked:
             no_red_dot_count += 1
             if no_red_dot_count >= NO_RED_DOT_FALLBACK:
@@ -515,60 +579,50 @@ def main():
                 continue
         else:
             no_red_dot_count = 0
+            last_msg_hash = ""
 
-        # 等待消息渲染完成
-        time.sleep(0.8)
-
-        # 跳转到最新消息
-        pyautogui.press('end')
-        time.sleep(0.6)
-
-        # ★ 图像变化检测：截图聊天区对比 hash，无变化则跳过
-        current_snap = snap_hash(hwnd)
-        if current_snap == last_snap_hash:
-            logging.info("[Hash] 聊天区无变化，跳过")
-            back_to_chat_list(hwnd)
-            time.sleep(CHECK_INTERVAL)
-            continue
-        last_snap_hash = current_snap
-
-        # 获取最新一条消息
-        msg = get_latest_bubble_text(hwnd)
-        if not msg:
-            logging.info("未识别到消息，返回列表")
-            last_snap_hash = snap_hash(hwnd)
-            back_to_chat_list(hwnd)
-            time.sleep(CHECK_INTERVAL)
-            continue
-
-        # 文字去重
-        mh = hashlib.md5(msg.encode()).hexdigest()[:8]
-        if mh == last_msg_hash:
-            logging.info("消息重复，跳过")
-            back_to_chat_list(hwnd)
-            time.sleep(CHECK_INTERVAL)
-            continue
-        last_msg_hash = mh
-
-        logging.info(f"📩 收到消息: {msg}")
-
-        # 唤醒词检查（正则移除）
-        if WAKE_WORD in msg:
-            question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip()
-            if not question:
-                question = "你好"
-            logging.info(f"触发唤醒，提问: {question}")
-            reply = coze_reply(question)
-            if reply:
-                send_message(hwnd, reply)
-            else:
-                send_message(hwnd, "抱歉，暂时无法回答")
-        else:
-            logging.info("未包含唤醒词，忽略")
-
-        # 回复后更新 hash 基准（等待屏幕稳定）
-        time.sleep(1)
+        # ======== 同一聊天多轮检测（处理多人同时提问） ========
+        chat_processed = 0
         last_snap_hash = snap_hash(hwnd)
+
+        for _pass in range(SAME_CHAT_MAX_PASS):
+            if _pass > 0:
+                current_snap = snap_hash(hwnd)
+                if current_snap == last_snap_hash:
+                    break
+            last_snap_hash = snap_hash(hwnd)
+
+            success, last_msg_hash = process_one_message(hwnd, last_msg_hash)
+            if success:
+                chat_processed += 1
+                total_processed += 1
+                logging.info(f"[统计] 本轮第{_pass+1}条 | 累计={total_processed}")
+            else:
+                break
+
+            # 短暂等待，检查是否有新消息弹出来
+            time.sleep(1.5)
+            pyautogui.press('end')
+            time.sleep(0.5)
+
+        # ======== stall 跟踪：无新消息则计数，有处理则清零 ========
+        if clicked_y is not None:
+            if chat_processed > 0:
+                stall_tracker.pop(clicked_y, None)
+                logging.info(f"[Stall] Y={clicked_y} 处理成功，清零")
+            else:
+                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 1
+                logging.info(f"[Stall] Y={clicked_y} 无新消息，stall={stall_tracker[clicked_y]}/3")
+
+        # ======== 清理过期 stall 记录（120秒无访问则清除） ========
+        for y in list(stall_tracker.keys()):
+            # 用简单的惰性清理：每次最多保留50条
+            if len(stall_tracker) > 50:
+                stall_tracker.pop(y, None)
+                break
+
+        # ======== 返回列表，准备下一轮 ========
+        time.sleep(1)
         back_to_chat_list(hwnd)
         time.sleep(CHECK_INTERVAL)
 
