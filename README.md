@@ -64,7 +64,7 @@ cp config.example.py config.py
 
 ```python
 # ==================== 唤醒词 ====================
-WAKE_WORD = "@管家小康"          # 触发机器人回复的关键词
+WAKE_WORD = "@管家"          # 触发机器人回复的关键词
 
 # ==================== Coze API ====================
 COZE_API_TOKEN = "pat_xxxxxx"    # Coze 个人访问令牌

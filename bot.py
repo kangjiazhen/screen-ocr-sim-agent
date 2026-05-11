@@ -1,26 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人 v28
+微信智能机器人 v29
 ========================================
-基于 v27 升级：可靠 + 性能 + @提醒
+基于 v28 升级：AI 后端可插拔
 升级：
-  - 真实@提醒 → 微信@面板模拟，群聊自动@发送者（非纯文本）
-  - OCR昵称提取 → 气泡上方45px捕获发送者昵称，内置企业微信后缀清理
-  - 异常消息快速熔断 → 图片/语音/视频等无文字消息，stall+2双倍跳过
-  - 自适应扫描间隔 → 有红点时 1s，60秒无活动降速到 3s
-  - Coze API 总超时熔断 → 60s 总时限 + 连续5次失败退避
-  - Coze 会话隔离 → user_id 基于红点Y坐标，不同聊天不串上下文
+  - AI 后端可插拔 → ai_backends 字典注册，配置 AI_BACKEND 一键切换
+  - 内置 Coze 后端（保持原有全部逻辑）
+  - 预留 OpenAI / 自定义后端模板
 保留：
-  - Y轴聚类 + 同聊多轮（最多4轮）
-  - stall 跟踪去重（3次无消息跳过，处理成功清零）
-  - PaddleOCR（PP-OCRv5，enable_mkldnn=False 规避3.3.x BUG）
-  - PrintWindow(PW_RENDERFULLCONTENT) 支持微信4.x GPU渲染
-  - 动态消息定位（像素行扫描 + 百分比坐标）
-  - 图像 hash 变化检测去重
+  - 真实@提醒 → 微信@面板模拟
+  - OCR昵称提取 → 企业微信后缀清理
+  - 异常消息快速熔断 → stall+2双倍跳过
+  - 自适应扫描间隔 → 1s / 3s
+  - Coze 总超时熔断 + 连续退避
+  - Coze 会话隔离
+  - Y轴聚类 + 同聊多轮
+  - stall 跟踪去重
+  - PaddleOCR（PP-OCRv5，enable_mkldnn=False）
+  - PrintWindow(PW_RENDERFULLCONTENT)
+  - 动态消息定位 + hash 变化检测
   - 唤醒词正则过滤
-  - Coze API v3 三步流程（chat → retrieve → message/list）
   - 配置抽离到 config.py
-
 ========================================
 """
 import sys
@@ -56,6 +56,7 @@ except ImportError:
     KEYBOARD_AVAILABLE = False
 
 from config import (
+    AI_BACKEND,
     WAKE_WORD,
     COZE_API_TOKEN, BOT_ID,
     COZE_CHAT_URL, COZE_RETRIEVE_URL, COZE_MESSAGE_LIST_URL,
@@ -320,7 +321,6 @@ def get_latest_bubble_text(hwnd):
     raw = "\n".join(lines)
     logging.info(f"  [OCR] 原始输出: 「{raw[:80]}...」" if len(raw) > 80 else f"  [OCR] 原始输出: 「{raw}」")
 
-    # ★ 从 OCR 原始行中提取发送者昵称（群聊@用）
     raw_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     nickname = ""
     if len(raw_lines) >= 2:
@@ -331,7 +331,6 @@ def get_latest_bubble_text(hwnd):
         second_zh = sum(1 for c in second if '\u4e00' <= c <= '\u9fff')
         second_alpha = sum(1 for c in second if c.isalpha())
         second_len = len(second)
-        # 昵称特征：第1行短(≤8字)，第2行明显更长或包含唤醒词
         is_short_nick = len(first) <= 8 and (first_zh + first_alpha) >= 1
         second_is_content = (second_zh + second_alpha >= 3) or second_len > 10 or WAKE_WORD in second
         if is_short_nick and second_is_content:
@@ -376,12 +375,12 @@ def get_latest_bubble_text(hwnd):
     return result, nickname
 
 
-# ==================== Coze 回复（v28：会话隔离 + 总超时熔断） ====================
+# ==================== AI 后端（v29：可插拔） ====================
 _coze_fail_count = 0
 COZE_FAIL_BACKOFF_MAX = 5
 
-def coze_reply(content, chat_user_id="wx-default"):
-    """返回 (reply_text, success) —— success=False 表示熔断中"""
+def _coze_reply(content, chat_user_id):
+    """Coze API v3 后端（内置默认）"""
     global _coze_fail_count
 
     if _coze_fail_count >= COZE_FAIL_BACKOFF_MAX:
@@ -404,7 +403,6 @@ def coze_reply(content, chat_user_id="wx-default"):
     COZE_TOTAL_TIMEOUT = 60
 
     try:
-        # Step 1: 发起对话
         resp = requests.post(COZE_CHAT_URL, headers=headers, json=payload, timeout=COZE_TIMEOUT)
         if time.time() - total_start > COZE_TOTAL_TIMEOUT:
             logging.error("[Coze] 总超时——POST阶段")
@@ -427,7 +425,6 @@ def coze_reply(content, chat_user_id="wx-default"):
         conv_id = data["data"]["conversation_id"]
         logging.info(f"[Coze] chat_id={chat_id[:20]}... 开始轮询")
 
-        # Step 2: 轮询等待
         for attempt in range(COZE_POLL_MAX):
             if time.time() - total_start > COZE_TOTAL_TIMEOUT:
                 logging.error(f"[Coze] 总超时——轮询阶段(attempt={attempt})")
@@ -455,7 +452,6 @@ def coze_reply(content, chat_user_id="wx-default"):
             _coze_fail_count += 1
             return None, True
 
-        # Step 3: 获取消息列表
         if time.time() - total_start > COZE_TOTAL_TIMEOUT:
             logging.error("[Coze] 总超时——获取消息列表阶段")
             _coze_fail_count += 1
@@ -498,7 +494,7 @@ def coze_reply(content, chat_user_id="wx-default"):
                         _coze_fail_count = 0
                         return result, True
 
-        logging.warning(f"[Coze] 未找到assistant回复，消息列表: {json.dumps(messages, ensure_ascii=False)[:500]}")
+        logging.warning(f"[Coze] 未找到assistant回复")
         return "（Coze 未生成回复）", True
 
     except requests.exceptions.Timeout:
@@ -509,6 +505,59 @@ def coze_reply(content, chat_user_id="wx-default"):
         logging.error(f"[Coze] 异常: {e}")
         _coze_fail_count += 1
         return None, True
+
+
+def _openai_reply(content, chat_user_id):
+    """
+    OpenAI 兼容后端示例（GPT / DeepSeek / 本地 Ollama 等）
+    启用方法:
+      1. pip install openai
+      2. config.py: AI_BACKEND = "openai"
+      3. config.py: 填 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+    """
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logging.error("[OpenAI] 请先安装: pip install openai")
+        return None, True
+
+    try:
+        from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL
+    except ImportError:
+        logging.error("[OpenAI] 请在 config.py 配置 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL")
+        return None, True
+
+    client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": content}],
+        timeout=60,
+    )
+    reply = resp.choices[0].message.content
+    logging.info(f"[OpenAI] 回复: {reply[:100]}")
+    return reply, True
+
+
+# ★ 后端注册表 —— 添加新后端只需在这里加一行
+ai_backends = {
+    "coze": _coze_reply,
+    "openai": _openai_reply,
+    # "custom": your_custom_function,  # 自定义后端示例
+}
+
+
+def ai_reply(content, chat_user_id="wx-default"):
+    """
+    统一 AI 回复入口。
+    根据 config.py 的 AI_BACKEND 自动选择后端，
+    所有后端签名统一: (content, chat_user_id) -> (reply_text, success)
+    """
+    backend_fn = ai_backends.get(AI_BACKEND)
+    if backend_fn is None:
+        logging.error(f"[AI] 未知后端: '{AI_BACKEND}'，可用: {list(ai_backends.keys())}")
+        return None, True
+    logging.debug(f"[AI] 使用后端: {AI_BACKEND}")
+    return backend_fn(content, chat_user_id)
 
 
 # ==================== 发送消息 ====================
@@ -545,25 +594,20 @@ def send_mention_reply(hwnd, nickname, text):
     pyautogui.click(input_x, input_y)
     time.sleep(0.3)
 
-    # ① 按 @ 键弹出成员选择面板
     pyautogui.press('@')
     time.sleep(0.4)
 
-    # ② 粘贴昵称到搜索框
     pyperclip.copy(nickname)
     pyautogui.hotkey('ctrl', 'v')
     time.sleep(0.3)
 
-    # ③ 回车选中第一个匹配 → 蓝色 @昵称
     pyautogui.press('enter')
     time.sleep(0.3)
 
-    # ④ 粘贴回复内容
     pyperclip.copy(text)
     pyautogui.hotkey('ctrl', 'v')
     time.sleep(0.25)
 
-    # ⑤ 发送
     pyautogui.press('enter')
     time.sleep(0.35)
 
@@ -577,11 +621,8 @@ def back_to_chat_list(hwnd):
     time.sleep(0.5)
 
 
-# ==================== 单条消息处理（v28：异常消息快速 stall） ====================
+# ==================== 单条消息处理 ====================
 def process_one_message(hwnd, last_msg_hash, chat_user_id):
-    """返回 (result_type, new_msg_hash)
-    result_type: 'ok'=成功回复, 'no_text'=无文字, 'duplicate'=重复, 'no_wake'=无唤醒词
-    """
     time.sleep(0.8)
     pyautogui.press('end')
     time.sleep(0.6)
@@ -592,7 +633,6 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         return 'no_text', last_msg_hash
 
     if nickname:
-        # 企业微信后缀 "@如米公寓" → 只保留前面的真实昵称
         nickname = re.sub(r'@\S+$', '', nickname).strip()
         logging.info(f"👤 发送者: {nickname}")
     logging.info(f"📩 收到消息: {msg}")
@@ -607,16 +647,15 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         if not question:
             question = "你好"
         logging.info(f"[触发] 唤醒词匹配，提问: {question}")
-        reply, coze_ok = coze_reply(question, chat_user_id)
-        if reply and coze_ok:
-            # ★ 群聊用真实 @面板，私聊直接发
+        reply, ok = ai_reply(question, chat_user_id)
+        if reply and ok:
             if nickname:
                 send_mention_reply(hwnd, nickname, reply)
                 logging.info(f"[@] 真实@「{nickname}」回复")
             else:
                 send_message(hwnd, reply)
-        elif not coze_ok:
-            logging.warning("[Coze] 熔断中，跳过回复")
+        elif not ok:
+            logging.warning(f"[AI] {AI_BACKEND} 请求失败，跳过回复")
         else:
             send_message(hwnd, "抱歉，暂时无法回答")
         return 'ok', mh
@@ -625,7 +664,7 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         return 'no_wake', last_msg_hash
 
 
-# ==================== 主循环（v28：自适应间隔） ====================
+# ==================== 主循环 ====================
 def main():
     hwnd = get_wechat_hwnd()
     if not hwnd:
@@ -647,7 +686,7 @@ def main():
     IDLE_INTERVAL = 3.0
     last_activity_time = time.time()
 
-    logging.info(f"🤖 机器人启动，唤醒词: {WAKE_WORD}")
+    logging.info(f"🤖 机器人启动，AI后端: {AI_BACKEND} | 唤醒词: {WAKE_WORD}")
     logging.info("📱 自适应间隔: 活跃1s / 空闲3s | 熔断退避: 连续5次失败暂停")
     logging.info("🔴 多红点模式：Y轴聚类 → 同聊多轮 → 逐个击破")
 
@@ -658,14 +697,12 @@ def main():
 
         ensure_visible(hwnd)
 
-        # ★ 自适应间隔：无红点且空闲超过60秒 → 降速
         idle_sec = time.time() - last_activity_time
         if idle_sec > 60:
             sleep_time = max(IDLE_INTERVAL, CHECK_INTERVAL)
         else:
             sleep_time = CHECK_INTERVAL
 
-        # ======== 红点检测 ========
         clicked, clicked_y = click_red_dot(hwnd, stall_tracker)
         if not clicked:
             no_red_dot_count += 1
@@ -681,10 +718,8 @@ def main():
             last_activity_time = time.time()
             last_msg_hash = ""
 
-        # ★ Coze 用户隔离：基于红点 Y 坐标生成唯一 ID
         chat_user_id = f"wx-{clicked_y}" if clicked_y else "wx-default"
 
-        # ======== 同聊多轮检测 ========
         chat_processed = 0
         has_text = False
         last_snap_hash = snap_hash(hwnd)
@@ -712,7 +747,6 @@ def main():
             pyautogui.press('end')
             time.sleep(0.5)
 
-        # ======== stall 跟踪（v28：异常消息双倍计数） ========
         if clicked_y is not None:
             if chat_processed > 0:
                 stall_tracker.pop(clicked_y, None)
@@ -721,16 +755,13 @@ def main():
                 stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 1
                 logging.info(f"[Stall] Y={clicked_y} 有文字但未触发，stall={stall_tracker[clicked_y]}/3")
             else:
-                # ★ 无文字消息（图片/语音等）：stall 双倍计数，快速跳过
                 stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 2
                 logging.info(f"[Stall] Y={clicked_y} 无文字(异常消息)，stall+2={stall_tracker[clicked_y]}/3")
 
-        # ======== 清理 stall ========
         if len(stall_tracker) > 50:
             oldest = min(stall_tracker.items(), key=lambda x: x[1])
             stall_tracker.pop(oldest[0], None)
 
-        # ======== 返回列表 ========
         time.sleep(1)
         back_to_chat_list(hwnd)
         time.sleep(CHECK_INTERVAL)
