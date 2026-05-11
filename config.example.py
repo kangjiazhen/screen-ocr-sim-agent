@@ -44,3 +44,16 @@ COZE_TIMEOUT = 30
 COZE_POLL_MAX = 30
 
 LOG_LEVEL = "INFO"
+
+# ==================== v30 问题统计 ====================
+# SQLite 数据库路径，自动创建
+STATS_DB_PATH = "questions.db"
+# 是否启用嵌入模型语义去重（需 pip install sentence-transformers）
+# Coze 分类前缀优先，此选项仅在没有分类前缀时作为降级兜底
+STATS_EMBEDDING_ENABLED = False
+
+# ==================== Web 后台 ====================
+# 0.0.0.0 = 局域网内其他电脑可访问, 127.0.0.1 = 仅本机访问
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 5000
+WEB_PASSWORD = "admin123"     # 请修改为你的密码！

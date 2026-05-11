@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人 v29
+微信智能机器人 v1.0
 ========================================
-基于 v28 升级：AI 后端可插拔
+基于 v29 升级：问题统计 & RAG 知识库
 升级：
-  - AI 后端可插拔 → ai_backends 字典注册，配置 AI_BACKEND 一键切换
-  - 内置 Coze 后端（保持原有全部逻辑）
-  - 预留 OpenAI / 自定义后端模板
+  - 问题统计 → question_stats.py 独立模块
+  - Coze 分类前缀解析 → 按 AI 分类自动聚类
+  - SQLite 持久化 → 面向 Web 后台可视化
+  - 语义相似度兜底 → 无分类时嵌入模型匹配
 保留：
+  - AI 后端可插拔
   - 真实@提醒 → 微信@面板模拟
   - OCR昵称提取 → 企业微信后缀清理
   - 异常消息快速熔断 → stall+2双倍跳过
@@ -64,7 +66,10 @@ from config import (
     COZE_TIMEOUT, COZE_POLL_MAX,
     LOG_LEVEL,
     PADDLEOCR_LANG, PADDLEOCR_USE_ANGLE_CLS,
+    STATS_DB_PATH,
 )
+
+from question_stats import QuestionStats
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -74,6 +79,7 @@ logging.basicConfig(
 ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
 _ocr = None
+_stats = None
 
 def init_ocr():
     global _ocr
@@ -649,6 +655,10 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         logging.info(f"[触发] 唤醒词匹配，提问: {question}")
         reply, ok = ai_reply(question, chat_user_id)
         if reply and ok:
+            try:
+                _stats.record(question, nickname=nickname or "", reply_full=reply, chat_user_id=chat_user_id)
+            except Exception:
+                pass
             if nickname:
                 send_mention_reply(hwnd, nickname, reply)
                 logging.info(f"[@] 真实@「{nickname}」回复")
@@ -673,6 +683,8 @@ def main():
 
     logging.info("✅ 微信窗口已找到")
     init_ocr()
+    global _stats
+    _stats = QuestionStats(STATS_DB_PATH)
     pyautogui.PAUSE = 0.2
     pyautogui.FAILSAFE = False
 
