@@ -1,16 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人（红点唤醒版）
+微信智能机器人 v26
 ========================================
-基于 v24 的文字扫描定位 + 红点检测触发 + Coze AI
-修复：
+基于 v25 的文字扫描定位 + 红点检测触发 + Coze AI
+升级：
+  - OCR 引擎 Tesseract → PaddleOCR（PP-OCRv5 模型，enable_mkldnn=False 规避 3.3.x PIR/oneDNN BUG）
+  - PaddleOCR 启动预加载（首条消息无需等待）
+  - 红点检测 v3 扩大扫描范围 + 双模式颜色检测
+  - Coze API v3 三步流程（chat → retrieve → message/list）
+  - 配置抽离到 config.py
+保留：
   - PrintWindow(PW_RENDERFULLCONTENT) 支持微信4.x GPU渲染
-  - 动态消息定位（不再固定裁剪区）
-  - 对比度增强预处理
-  - 坐标百分比化、唤醒词正则过滤
+  - 动态消息定位（像素行扫描 + 百分比坐标）
+  - 图像 hash 变化检测去重
+  - 唤醒词正则过滤
 ========================================
 """
 import sys
+import os as _os
+
+# ★ oneDNN 禁用（避免 Paddle 3.3.x PIR 属性转换崩溃）
+_os.environ["FLAGS_use_onednn"] = "0"
+_os.environ["FLAGS_onednn_use_cache"] = "0"
+_os.environ["KMP_AFFINITY"] = "disabled"
+_os.environ["KMP_BLOCKTIME"] = "0"
 import re
 import json
 import time
@@ -26,8 +39,8 @@ import win32con
 import win32ui
 import win32api
 import numpy as np
-from PIL import Image, ImageEnhance
-import pytesseract
+from PIL import Image
+from paddleocr import PaddleOCR
 import requests
 
 try:
@@ -41,10 +54,10 @@ from config import (
     WAKE_WORD,
     COZE_API_TOKEN, BOT_ID,
     COZE_CHAT_URL, COZE_RETRIEVE_URL, COZE_MESSAGE_LIST_URL,
-    TESSERACT_PATHS,
     CHECK_INTERVAL, NO_RED_DOT_FALLBACK,
     COZE_TIMEOUT, COZE_POLL_MAX,
     LOG_LEVEL,
+    PADDLEOCR_LANG, PADDLEOCR_USE_ANGLE_CLS,
 )
 
 logging.basicConfig(
@@ -55,20 +68,15 @@ logging.basicConfig(
 # DPI 感知
 ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
-# Tesseract OCR 自动检测
-import os as _os
-_tesseract_found = None
-for _tp in TESSERACT_PATHS:
-    _expanded = _os.path.expandvars(_tp)
-    if _os.path.exists(_expanded):
-        _tesseract_found = _expanded
-        break
-if _tesseract_found:
-    pytesseract.pytesseract.tesseract_cmd = _tesseract_found
-else:
-    pytesseract.pytesseract.tesseract_cmd = None
-    logging.warning("未找到 Tesseract OCR！请从 https://github.com/UB-Mannheim/tesseract/wiki 下载安装")
-    logging.warning("安装时请勾选中文简体语言包 (chi_sim)")
+# PaddleOCR 全局实例（启动时预加载，后续复用）
+_ocr = None
+
+def init_ocr():
+    global _ocr
+    logging.info("[OCR] 正在预加载 PaddleOCR 模型...")
+    _ocr = PaddleOCR(use_textline_orientation=PADDLEOCR_USE_ANGLE_CLS, lang=PADDLEOCR_LANG, enable_mkldnn=False)
+    logging.info("[OCR] PaddleOCR 预加载完成")
+    return _ocr
 
 
 # ==================== 窗口工具 ====================
@@ -110,6 +118,7 @@ def bring_to_front(hwnd):
     except:
         pass
 
+
 # ==================== 截图（支持GPU渲染） ====================
 def capture_window(hwnd):
     """PrintWindow + PW_RENDERFULLCONTENT"""
@@ -135,32 +144,40 @@ def capture_window(hwnd):
     return img
 
 
-# ==================== 红点检测（v2：放宽阈值 + 调试日志） ====================
+# ==================== 红点检测（v3：适配企业微信 + 多色系） ====================
 def find_red_dot(hwnd):
+    """扫描左侧聊天列表区，检测未读消息标记（红点/数字徽章）"""
     try:
         l, t, r, b = win32gui.GetWindowRect(hwnd)
-        scan_l = l + 20
-        scan_t = t + 80
-        scan_r = l + int((r - l) * 0.35)
-        scan_b = b - 50
+        w = r - l
+        h = b - t
+        # 聊天列表区：左侧 0~50% 宽度，顶部 12%~88% 高度
+        scan_l = l + int(w * 0.04)
+        scan_t = t + int(h * 0.12)
+        scan_r = l + int(w * 0.50)
+        scan_b = t + int(h * 0.88)
         region_w = scan_r - scan_l
         region_h = scan_b - scan_t
         screenshot = pyautogui.screenshot(region=(scan_l, scan_t, region_w, region_h))
-        w, h = screenshot.size
+        sw, sh = screenshot.size
         red_pixels = []
-        for y in range(0, h, 3):
-            for x in range(0, w, 3):
+        for y in range(0, sh, 2):
+            for x in range(0, sw, 2):
                 r_pix, g_pix, b_pix = screenshot.getpixel((x, y))
-                if r_pix > 160 and g_pix < r_pix * 0.55 and b_pix < r_pix * 0.55:
+                # 模式1：纯红/粉红（未读红点） R主导，G和B明显低
+                # 模式2：暗红徽章（数字背景） R>130，G和B都较低
+                is_red_dot = (r_pix > 160 and g_pix < r_pix * 0.55 and b_pix < r_pix * 0.55)
+                is_badge = (r_pix > 130 and g_pix < 100 and b_pix < 100 and r_pix > g_pix + 40)
+                if is_red_dot or is_badge:
                     red_pixels.append((scan_l + x, scan_t + y))
-        logging.info(f"[红点扫描] 区域={region_w}x{region_h}  红像素数={len(red_pixels)}")
+        logging.info(f"[红点扫描] 区域={region_w}x{region_h}  红/徽章像素数={len(red_pixels)}")
         if len(red_pixels) > 2:
             avg_x = sum(p[0] for p in red_pixels) // len(red_pixels)
             avg_y = sum(p[1] for p in red_pixels) // len(red_pixels)
-            logging.info(f"[红点] 检测到红点 @ ({avg_x}, {avg_y}) 共{len(red_pixels)}像素")
+            logging.info(f"[红点] 检测到 @ ({avg_x}, {avg_y}) 共{len(red_pixels)}像素")
             return avg_x, avg_y
         else:
-            logging.info("[红点] 未检测到红点")
+            logging.info(f"[红点] 未检测到（仅{len(red_pixels)}像素）")
     except Exception as e:
         logging.error(f"[红点] 扫描异常: {e}")
     return None
@@ -261,22 +278,35 @@ def get_latest_bubble_text(hwnd):
 
     crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
 
-    # 预处理：3倍放大 + 对比度增强
-    scale = 3
-    big = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
-    gray = big.convert('L')
-    enhanced = ImageEnhance.Contrast(gray).enhance(2.5)
-
+    # PaddleOCR 直接识别（无需手动放大/对比度增强，模型自带预处理）
+    crop_arr = np.array(crop)
     try:
-        if pytesseract.pytesseract.tesseract_cmd is None:
-            logging.error("[OCR] Tesseract 未安装，无法识别文字")
-            return ""
-        raw = pytesseract.image_to_string(
-            enhanced, config='--oem 3 --psm 6 -l chi_sim+eng'
-        ).strip()
+        if _ocr is None:
+            logging.error("[OCR] PaddleOCR 未初始化，尝试重新加载...")
+            init_ocr()
+            if _ocr is None:
+                return ""
+        ocr = _ocr
+        ocr_result = ocr.predict(crop_arr)
     except Exception as e:
-        logging.error(f"[OCR] 识别失败: {e}")
+        logging.error(f"[OCR] PaddleOCR 识别失败: {e}")
         return ""
+
+    if not ocr_result or len(ocr_result) == 0:
+        logging.info("[OCR] PaddleOCR 未检测到文字")
+        return ""
+
+    lines = []
+    for item in ocr_result:
+        rec_texts = item.get("rec_texts", [])
+        rec_scores = item.get("rec_scores", [])
+        for i, text in enumerate(rec_texts):
+            conf = rec_scores[i] if i < len(rec_scores) else 0
+            if text.strip():
+                lines.append(text.strip())
+                logging.info(f"  [OCR] 片段: 「{text}」 置信度={conf:.2f}")
+
+    raw = "\n".join(lines)
 
     logging.info(f"  [OCR] 原始输出: 「{raw[:80]}...」" if len(raw) > 80 else f"  [OCR] 原始输出: 「{raw}」")
 
@@ -456,6 +486,7 @@ def main():
         return
 
     logging.info("✅ 微信窗口已找到")
+    init_ocr()
     pyautogui.PAUSE = 0.2
     pyautogui.FAILSAFE = False
 
