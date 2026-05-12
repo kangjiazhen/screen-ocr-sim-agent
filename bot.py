@@ -1,31 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人 v1.0.31
+微信智能机器人 v1.0.32
 ========================================
 变更:
-  - 问题统计 → question_stats.py 独立模块，SQLite 三表结构
-  - Coze 分类双保险 → 冒号解析 + 管理分类子串匹配
-  - Web 后台 → web_app.py，筛选/编辑/分类管理/Excel导出
-  - 三状态管理 → 待答复/已答复/不予处理
-  - 回复去前缀 → 发送时自动剥离分类标签
-  - 跨群去重 → 按昵称隔离 per_chat_hash
-  - 按小时自动备份 → 首次写入触发，保留30天
-  - 密码保护 → Web 登录认证，支持局域网协同
-保留:
-  - AI 后端可插拔
-  - 真实@提醒 → 微信@面板模拟
-  - OCR昵称提取 → 企业微信后缀清理
-  - 异常消息快速熔断 → stall+2双倍跳过
-  - 自适应扫描间隔 → 1s / 3s
-  - Coze 总超时熔断 + 连续退避
-  - Coze 会话隔离
-  - Y轴聚类 + 同聊多轮
-  - stall 跟踪去重
-  - PaddleOCR（PP-OCRv5，enable_mkldnn=False）
-  - PrintWindow(PW_RENDERFULLCONTENT)
-  - 动态消息定位 + hash 变化检测
-  - 唤醒词正则过滤
-  - 配置抽离到 config.py
+  - ★ 修复多红点场景第二个红点被漏处理 — 主循环移除 back_to_chat_list 硬编码点击
+  - ★ 修复同一消息被重复回复 — stall=99 永久标记 + Y轴±8px 容差匹配
+  - ★ 修复点击红点B却读取红点A的聊天内容 — snap_hash 校验聊天是否真实切换
+  - ★ 红点处理改为 Y 轴最高优先 → reversed(clusters)
+  - ★ 主循环简化 — 每轮一个红点，处理完回到顶部重新扫描，不再硬编码导航
+  - back_to_chat_list 改为标题栏安全点击，避免 Esc 退出微信 / 坐标误触聊天项
 ========================================
 """
 import sys
@@ -63,6 +46,7 @@ except ImportError:
 from config import (
     AI_BACKEND,
     WAKE_WORD,
+    WECHAT_PATH,
     COZE_API_TOKEN, BOT_ID,
     COZE_CHAT_URL, COZE_RETRIEVE_URL, COZE_MESSAGE_LIST_URL,
     CHECK_INTERVAL, NO_RED_DOT_FALLBACK,
@@ -94,20 +78,151 @@ def init_ocr():
 
 # ==================== 窗口工具 ====================
 def get_wechat_hwnd():
-    hwnd = win32gui.FindWindow("WeChatMainWndForPC", None)
+    hwnd = _find_wechat_by_class()
     if hwnd:
-        return hwnd
-    hwnd = win32gui.FindWindow("Qt51514QWindowIcon", None)
-    if hwnd:
+        logging.info(f"[窗口] 类名匹配: hwnd={hwnd} title={win32gui.GetWindowText(hwnd)}")
         return hwnd
     results = []
     def callback(hwnd, extra):
-        if win32gui.IsWindowVisible(hwnd):
-            title = win32gui.GetWindowText(hwnd)
-            if '微信' in title:
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = win32gui.GetWindowText(hwnd)
+        if '微信' in title:
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            w, h = r - l, b - t
+            if w > 500 and h > 400:
                 extra.append(hwnd)
     win32gui.EnumWindows(callback, results)
-    return results[0] if results else None
+    if results:
+        logging.info(f"[窗口] 标题枚举匹配: hwnd={results[0]} title={win32gui.GetWindowText(results[0])}")
+        return results[0]
+    logging.warning("[窗口] 所有方式均未找到有效微信窗口")
+    return None
+
+
+def _valid_wechat_window(hwnd):
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+        if not win32gui.IsWindowVisible(hwnd):
+            return False
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        w, h = r - l, b - t
+        if w < 500 or h < 400:
+            return False
+        title = win32gui.GetWindowText(hwnd)
+        return '微信' in title
+    except Exception:
+        return False
+
+
+def _find_wechat_by_class():
+    candidates = []
+    def enum_cb(hwnd, _):
+        class_name = win32gui.GetClassName(hwnd)
+        if class_name in ("WeChatMainWndForPC", "Qt51514QWindowIcon"):
+            if win32gui.IsWindow(hwnd):
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                area = max(0, r - l) * max(0, b - t)
+                candidates.append((hwnd, area))
+    win32gui.EnumWindows(enum_cb, None)
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best, area = candidates[0]
+        logging.info(f"[窗口] 类名枚举: hwnd={best} area={area} visible={win32gui.IsWindowVisible(best)} title={win32gui.GetWindowText(best)} candidates={len(candidates)}")
+        return best
+    logging.warning("[窗口] 未找到任何 WeChatMainWndForPC 窗口")
+    return None
+
+
+def restore_wechat_window(hwnd):
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    if not win32gui.IsWindowVisible(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+    time.sleep(0.5)
+    try:
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        time.sleep(0.3)
+    except:
+        pass
+
+
+def _is_wechat_running():
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq WeChat.exe', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, shell=True,
+        )
+        if 'WeChat.exe' in result.stdout:
+            return True
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq Weixin.exe', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, shell=True,
+        )
+        return 'Weixin.exe' in result.stdout
+    except Exception:
+        return False
+
+
+def try_restore_wechat():
+    hwnd = _find_wechat_by_class()
+    if hwnd:
+        restore_wechat_window(hwnd)
+        return hwnd
+    return None
+
+
+def activate_tray_wechat():
+    if not _is_wechat_running():
+        return False
+    try:
+        pyautogui.hotkey('ctrl', 'alt', 'w')
+        time.sleep(1)
+        hwnd = _find_wechat_by_class()
+        if hwnd:
+            restore_wechat_window(hwnd)
+            return True
+        time.sleep(2)
+        hwnd = _find_wechat_by_class()
+        if hwnd:
+            restore_wechat_window(hwnd)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def launch_wechat():
+    import subprocess
+    path = WECHAT_PATH
+    if path and _os.path.exists(path):
+        logging.info(f"[窗口] 正在启动微信: {path}")
+        subprocess.Popen(path, shell=True)
+        return True
+    wechat_paths = [
+        _os.path.expandvars(r"%ProgramFiles%\Tencent\WeChat\WeChat.exe"),
+        _os.path.expandvars(r"%ProgramFiles(x86)%\Tencent\WeChat\WeChat.exe"),
+        _os.path.expandvars(r"%ProgramFiles%\Tencent\Weixin\Weixin.exe"),
+        _os.path.expandvars(r"%ProgramFiles(x86)%\Tencent\Weixin\Weixin.exe"),
+        _os.path.expandvars(r"%LocalAppData%\Programs\Tencent\WeChat\WeChat.exe"),
+    ]
+    for p in wechat_paths:
+        if _os.path.exists(p):
+            logging.info(f"[窗口] 正在启动微信: {p}")
+            subprocess.Popen(p, shell=True)
+            return True
+    return False
+
+
+def wait_wechat(timeout=30):
+    for _ in range(timeout):
+        time.sleep(1)
+        hwnd = get_wechat_hwnd()
+        if hwnd:
+            return hwnd
+    return None
 
 
 def get_rect(hwnd):
@@ -158,7 +273,7 @@ def capture_window(hwnd):
 # ==================== 红点检测 v4 ====================
 def find_red_dot_clusters(hwnd):
     try:
-        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        l, t, r, b = get_rect(hwnd)
         w = r - l
         h = b - t
         scan_l = l + int(w * 0.04)
@@ -218,13 +333,21 @@ def find_red_dot_clusters(hwnd):
     return []
 
 
+STALL_Y_TOLERANCE = 8
+
+def _get_stall(stall_tracker, y):
+    for tracked_y, count in stall_tracker.items():
+        if abs(tracked_y - y) <= STALL_Y_TOLERANCE:
+            return count
+    return 0
+
 def click_red_dot(hwnd, stall_tracker):
     clusters = find_red_dot_clusters(hwnd)
     if not clusters:
         return False, None
 
-    for cx, cy, pc in clusters:
-        stall_count = stall_tracker.get(cy, 0)
+    for cx, cy, pc in reversed(clusters):
+        stall_count = _get_stall(stall_tracker, cy)
         if stall_count >= 3:
             logging.info(f"[红点] 跳过簇 ({cx},{cy}) —— stall={stall_count}")
             continue
@@ -633,9 +756,10 @@ def send_mention_reply(hwnd, nickname, text):
 
 
 def back_to_chat_list(hwnd):
-    l, t, _, _ = get_rect(hwnd)
-    pyautogui.click(l + 80, t + 150)
-    time.sleep(0.5)
+    l, t, r, b = get_rect(hwnd)
+    w = r - l
+    pyautogui.click(l + w // 2, t + 8)
+    time.sleep(0.3)
 
 
 # ==================== 单条消息处理 ====================
@@ -689,12 +813,30 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
 
 # ==================== 主循环 ====================
 def main():
-    hwnd = get_wechat_hwnd()
+    hwnd = try_restore_wechat()
+    if hwnd:
+        logging.info("✅ 微信窗口已恢复")
+    elif _is_wechat_running():
+        logging.info("🔍 微信在后台运行（托盘），尝试激活...")
+        if activate_tray_wechat():
+            hwnd = _find_wechat_by_class()
+            logging.info("✅ 微信窗口已从托盘激活")
+        else:
+            logging.warning("[窗口] 无法激活托盘微信，尝试重新启动...")
+            launch_wechat()
+            hwnd = wait_wechat(60)
+    else:
+        logging.info("🚀 微信未运行，正在启动...")
+        if not launch_wechat():
+            logging.error("❌ 未找到微信安装路径，请在 config.py 中配置 WECHAT_PATH")
+            logging.error("   例如: WECHAT_PATH = r\"C:\\Program Files\\Tencent\\WeChat\\WeChat.exe\"")
+            return
+        logging.info("⏳ 等待微信窗口就绪（最多60秒）...")
+        hwnd = wait_wechat(60)
     if not hwnd:
-        logging.error("找不到微信窗口")
+        logging.error("❌ 无法获取微信窗口，请检查微信是否正常")
         return
 
-    logging.info("✅ 微信窗口已找到")
     init_ocr()
     global _stats
     _stats = QuestionStats(STATS_DB_PATH)
@@ -706,10 +848,13 @@ def main():
     last_snap_hash = ""
     no_red_dot_count = 0
     total_processed = 0
+    last_processed_chat_hash = ""
 
     SAME_CHAT_MAX_PASS = 4
     IDLE_INTERVAL = 3.0
+    WINDOW_RECHECK_INTERVAL = 30
     last_activity_time = time.time()
+    last_window_check = 0
 
     logging.info(f"🤖 机器人启动，AI后端: {AI_BACKEND} | 唤醒词: {WAKE_WORD}")
     logging.info("📱 自适应间隔: 活跃1s / 空闲3s | 熔断退避: 连续5次失败暂停")
@@ -720,13 +865,83 @@ def main():
             logging.info("检测到退出键")
             break
 
-        ensure_visible(hwnd)
+        now_ts = time.time()
+        if now_ts - last_window_check > WINDOW_RECHECK_INTERVAL:
+            last_window_check = now_ts
+            if not _find_wechat_by_class():
+                logging.warning("[窗口] 微信窗口丢失，重新启动...")
+                launch_wechat()
+                new_hwnd = wait_wechat(30)
+                if new_hwnd:
+                    hwnd = new_hwnd
+                    restore_wechat_window(hwnd)
+                    stall_tracker.clear()
+                    per_chat_hash.clear()
+                    no_red_dot_count = 0
+                    logging.info("[窗口] 微信窗口已恢复，状态已重置")
+                else:
+                    logging.warning("[窗口] 仍未找到微信窗口，等待10秒...")
+                    time.sleep(10)
+                    continue
+
+        restore_wechat_window(hwnd)
 
         idle_sec = time.time() - last_activity_time
         if idle_sec > 60:
             sleep_time = max(IDLE_INTERVAL, CHECK_INTERVAL)
         else:
             sleep_time = CHECK_INTERVAL
+
+        def handle_current_chat():
+            nonlocal total_processed, last_processed_chat_hash
+            cid = f"wx-{clicked_y}" if clicked_y else "wx-default"
+            ckey = per_chat_hash.get("nick_map", {}).get(str(clicked_y), cid)
+            mh = per_chat_hash.get(ckey, "")
+            processed = 0
+            text_seen = False
+            first_sh = snap_hash(hwnd)
+            if first_sh == last_processed_chat_hash and last_processed_chat_hash:
+                logging.info("[切换] 聊天未切换，停留在上次会话，跳过")
+                return
+            last_sh = first_sh
+
+            for _pass in range(SAME_CHAT_MAX_PASS):
+                if _pass > 0:
+                    cur = snap_hash(hwnd)
+                    if cur == last_sh:
+                        break
+                last_sh = snap_hash(hwnd)
+
+                rt, mh, nick = process_one_message(hwnd, mh, cid)
+                if nick:
+                    if "nick_map" not in per_chat_hash:
+                        per_chat_hash["nick_map"] = {}
+                    per_chat_hash["nick_map"][str(clicked_y)] = nick
+                    ckey = nick
+                per_chat_hash[ckey] = mh
+                if rt == 'ok':
+                    processed += 1
+                    total_processed += 1
+                    text_seen = True
+                    logging.info(f"[统计] 本轮第{_pass+1}条 | 累计={total_processed}")
+                    break
+                elif rt == 'no_text':
+                    text_seen = False
+                    break
+                else:
+                    break
+
+            if processed > 0:
+                stall_tracker[clicked_y] = 99
+                logging.info(f"[Stall] Y={clicked_y} 处理{processed}条，标记完成")
+            elif text_seen:
+                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 1
+                logging.info(f"[Stall] Y={clicked_y} 有文字但未触发，stall={stall_tracker[clicked_y]}/3")
+            else:
+                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 2
+                logging.info(f"[Stall] Y={clicked_y} 无文字(异常消息)，stall+2={stall_tracker[clicked_y]}/3")
+
+            last_processed_chat_hash = snap_hash(hwnd)
 
         clicked, clicked_y = click_red_dot(hwnd, stall_tracker)
         if not clicked:
@@ -736,70 +951,22 @@ def main():
                 no_red_dot_count = 0
                 last_activity_time = time.time()
                 per_chat_hash.clear()
+                process_one_message(hwnd, "", "wx-default")
             else:
                 time.sleep(sleep_time)
-                continue
-        else:
-            no_red_dot_count = 0
-            last_activity_time = time.time()
+            continue
 
-        chat_user_id = f"wx-{clicked_y}" if clicked_y else "wx-default"
-        chat_key = per_chat_hash.get("nick_map", {}).get(str(clicked_y), chat_user_id)
-        last_msg_hash = per_chat_hash.get(chat_key, "")
+        no_red_dot_count = 0
+        last_activity_time = time.time()
 
-        chat_processed = 0
-        has_text = False
-        last_snap_hash = snap_hash(hwnd)
-
-        for _pass in range(SAME_CHAT_MAX_PASS):
-            if _pass > 0:
-                current_snap = snap_hash(hwnd)
-                if current_snap == last_snap_hash:
-                    break
-            last_snap_hash = snap_hash(hwnd)
-
-            result_type, last_msg_hash, nickname = process_one_message(hwnd, last_msg_hash, chat_user_id)
-            if nickname:
-                if "nick_map" not in per_chat_hash:
-                    per_chat_hash["nick_map"] = {}
-                per_chat_hash["nick_map"][str(clicked_y)] = nickname
-                chat_key = nickname
-            per_chat_hash[chat_key] = last_msg_hash
-            if result_type == 'ok':
-                chat_processed += 1
-                total_processed += 1
-                has_text = True
-                logging.info(f"[统计] 本轮第{_pass+1}条 | 累计={total_processed}")
-            elif result_type == 'no_text':
-                has_text = False
-                break
-            else:
-                break
-
-            time.sleep(1.5)
-            pyautogui.press('end')
-            time.sleep(0.5)
-
-        if clicked_y is not None:
-            if chat_processed > 0:
-                stall_tracker.pop(clicked_y, None)
-                logging.info(f"[Stall] Y={clicked_y} 处理{chat_processed}条，清零")
-            elif has_text:
-                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 1
-                logging.info(f"[Stall] Y={clicked_y} 有文字但未触发，stall={stall_tracker[clicked_y]}/3")
-            else:
-                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 2
-                logging.info(f"[Stall] Y={clicked_y} 无文字(异常消息)，stall+2={stall_tracker[clicked_y]}/3")
+        handle_current_chat()
 
         if len(stall_tracker) > 50:
-            oldest = min(stall_tracker.items(), key=lambda x: x[1])
-            stall_tracker.pop(oldest[0], None)
+            stall_tracker.pop(next(iter(stall_tracker)), None)
 
         if len(per_chat_hash) > 50:
             per_chat_hash.pop(next(iter(per_chat_hash)), None)
 
-        time.sleep(1)
-        back_to_chat_list(hwnd)
         time.sleep(CHECK_INTERVAL)
 
 

@@ -43,6 +43,11 @@ NO_RED_DOT_FALLBACK = 10
 COZE_TIMEOUT = 30
 COZE_POLL_MAX = 30
 
+# ==================== 微信客户端 ====================
+WECHAT_PATH = r""
+# 填写微信安装路径，留空则自动查找常见路径
+# 例如: r"C:\Program Files\Tencent\WeChat\WeChat.exe"
+
 LOG_LEVEL = "INFO"
 
 # ==================== v30 问题统计 ====================
