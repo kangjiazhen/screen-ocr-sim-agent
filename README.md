@@ -130,6 +130,20 @@ python web_app.py
 | 数据存储 | SQLite (WAL 模式)，questions + question_clusters + categories 三表，按小时/日自动备份 |
 | Web 后台 | Flask 单文件应用，内嵌 HTML/CSS/JS，零外部前端依赖 |
 
+## 技术栈
+
+| 层级 | 技术 | 用途 |
+|------|------|------|
+| 语言 | Python 3.8+ | 主程序 |
+| GUI 自动化 | pyautogui / pyperclip / pywin32 | 鼠标点击、键盘输入、剪贴板粘贴、窗口操控 |
+| 截图 | PrintWindow(PW_RENDERFULLCONTENT) | 微信 4.x GPU 渲染截图 |
+| OCR | PaddleOCR (PP-OCRv5) | 中文文字识别 |
+| AI 后端 | Coze API v3 / OpenAI 兼容 | 消息回复生成 |
+| 数据库 | SQLite (WAL 模式) | 问题持久化、自动备份 |
+| Web 后台 | Flask + 内嵌 HTML/CSS/JS | 单文件零外部前端依赖 |
+| Excel | openpyxl | 明细 + 汇总 + 知识库导出 |
+| 图像处理 | Pillow / numpy | 截图裁剪、红点像素检测、文字区域定位 |
+
 ## 环境要求
 
 - **Windows 10/11**（依赖 win32 API 和 DWM）
