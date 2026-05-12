@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人 v1.0
+微信智能机器人 v1.0.31
 ========================================
-基于 v29 升级：问题统计 & RAG 知识库
-升级：
-  - 问题统计 → question_stats.py 独立模块
-  - Coze 分类前缀解析 → 按 AI 分类自动聚类
-  - SQLite 持久化 → 面向 Web 后台可视化
-  - 语义相似度兜底 → 无分类时嵌入模型匹配
-保留：
+变更:
+  - 问题统计 → question_stats.py 独立模块，SQLite 三表结构
+  - Coze 分类双保险 → 冒号解析 + 管理分类子串匹配
+  - Web 后台 → web_app.py，筛选/编辑/分类管理/Excel导出
+  - 三状态管理 → 待答复/已答复/不予处理
+  - 回复去前缀 → 发送时自动剥离分类标签
+  - 跨群去重 → 按昵称隔离 per_chat_hash
+  - 按小时自动备份 → 首次写入触发，保留30天
+  - 密码保护 → Web 登录认证，支持局域网协同
+保留:
   - AI 后端可插拔
   - 真实@提醒 → 微信@面板模拟
   - OCR昵称提取 → 企业微信后缀清理
@@ -69,7 +72,7 @@ from config import (
     STATS_DB_PATH,
 )
 
-from question_stats import QuestionStats
+from question_stats import QuestionStats, parse_coze_category
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -346,6 +349,8 @@ def get_latest_bubble_text(hwnd):
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     clean = []
     for ln in lines:
+        if nickname and ln == nickname:
+            continue
         zh = sum(1 for c in ln if '\u4e00' <= c <= '\u9fff')
         alpha = sum(1 for c in ln if c.isalpha())
         digit = sum(1 for c in ln if c.isdigit())
@@ -409,6 +414,7 @@ def _coze_reply(content, chat_user_id):
     COZE_TOTAL_TIMEOUT = 60
 
     try:
+        logging.info(f"[Coze] POST 请求: bot_id={BOT_ID} user_id={chat_user_id} content={content[:60]}...")
         resp = requests.post(COZE_CHAT_URL, headers=headers, json=payload, timeout=COZE_TIMEOUT)
         if time.time() - total_start > COZE_TOTAL_TIMEOUT:
             logging.error("[Coze] 总超时——POST阶段")
@@ -427,6 +433,7 @@ def _coze_reply(content, chat_user_id):
             _coze_fail_count += 1
             return None, True
 
+        logging.debug(f"[Coze] POST 完整响应: {json.dumps(data, ensure_ascii=False)}")
         chat_id = data["data"]["id"]
         conv_id = data["data"]["conversation_id"]
         logging.info(f"[Coze] chat_id={chat_id[:20]}... 开始轮询")
@@ -447,6 +454,7 @@ def _coze_reply(content, chat_user_id):
             if "data" not in d:
                 continue
             status = d["data"]["status"]
+            logging.debug(f"[Coze] 轮询 attempt={attempt} status={status} 完整响应: {json.dumps(d, ensure_ascii=False)[:500]}")
             if status == "completed":
                 break
             elif status == "failed":
@@ -474,6 +482,8 @@ def _coze_reply(content, chat_user_id):
         msg_data = r.json()
         messages = msg_data.get("data", [])
 
+        logging.info(f"[Coze] 消息列表完整响应: {json.dumps(msg_data, ensure_ascii=False)}")
+
         if not messages:
             messages = msg_data if isinstance(msg_data, list) else []
 
@@ -485,6 +495,7 @@ def _coze_reply(content, chat_user_id):
             logging.info(f"[Coze] msg[{i}] role={role} type={msg_type}")
             content_raw = msg.get("content", "")
             if role == "assistant" or msg_type == "answer":
+                logging.info(f"[Coze] msg[{i}] 完整数据: {json.dumps(msg, ensure_ascii=False)}")
                 if isinstance(content_raw, str) and content_raw.strip():
                     logging.info(f"[Coze] 提取回复: {content_raw[:100]}")
                     _coze_fail_count = 0
@@ -636,7 +647,7 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
     msg, nickname = get_latest_bubble_text(hwnd)
     if not msg:
         logging.info("[处理] 未识别到文字 → 可能是图片/语音/视频")
-        return 'no_text', last_msg_hash
+        return 'no_text', last_msg_hash, nickname
 
     if nickname:
         nickname = re.sub(r'@\S+$', '', nickname).strip()
@@ -646,7 +657,7 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
     mh = hashlib.md5(msg.encode()).hexdigest()[:8]
     if mh == last_msg_hash:
         logging.info("[去重] 当前会话消息重复")
-        return 'duplicate', last_msg_hash
+        return 'duplicate', last_msg_hash, nickname
 
     if WAKE_WORD in msg:
         question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip()
@@ -654,24 +665,26 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
             question = "你好"
         logging.info(f"[触发] 唤醒词匹配，提问: {question}")
         reply, ok = ai_reply(question, chat_user_id)
+        reply_body = parse_coze_category(reply)[1] if reply else ""
         if reply and ok:
             try:
                 _stats.record(question, nickname=nickname or "", reply_full=reply, chat_user_id=chat_user_id)
             except Exception:
                 pass
+            send_text = reply_body or reply
             if nickname:
-                send_mention_reply(hwnd, nickname, reply)
+                send_mention_reply(hwnd, nickname, send_text)
                 logging.info(f"[@] 真实@「{nickname}」回复")
             else:
-                send_message(hwnd, reply)
+                send_message(hwnd, send_text)
         elif not ok:
             logging.warning(f"[AI] {AI_BACKEND} 请求失败，跳过回复")
         else:
             send_message(hwnd, "抱歉，暂时无法回答")
-        return 'ok', mh
+        return 'ok', mh, nickname
     else:
         logging.info("[跳过] 未包含唤醒词")
-        return 'no_wake', last_msg_hash
+        return 'no_wake', last_msg_hash, nickname
 
 
 # ==================== 主循环 ====================
@@ -689,7 +702,7 @@ def main():
     pyautogui.FAILSAFE = False
 
     stall_tracker = {}
-    last_msg_hash = ""
+    per_chat_hash = {}
     last_snap_hash = ""
     no_red_dot_count = 0
     total_processed = 0
@@ -722,15 +735,17 @@ def main():
                 logging.info(f"[降级] 连续{NO_RED_DOT_FALLBACK}次无红点，强制检查当前聊天")
                 no_red_dot_count = 0
                 last_activity_time = time.time()
+                per_chat_hash.clear()
             else:
                 time.sleep(sleep_time)
                 continue
         else:
             no_red_dot_count = 0
             last_activity_time = time.time()
-            last_msg_hash = ""
 
         chat_user_id = f"wx-{clicked_y}" if clicked_y else "wx-default"
+        chat_key = per_chat_hash.get("nick_map", {}).get(str(clicked_y), chat_user_id)
+        last_msg_hash = per_chat_hash.get(chat_key, "")
 
         chat_processed = 0
         has_text = False
@@ -743,7 +758,13 @@ def main():
                     break
             last_snap_hash = snap_hash(hwnd)
 
-            result_type, last_msg_hash = process_one_message(hwnd, last_msg_hash, chat_user_id)
+            result_type, last_msg_hash, nickname = process_one_message(hwnd, last_msg_hash, chat_user_id)
+            if nickname:
+                if "nick_map" not in per_chat_hash:
+                    per_chat_hash["nick_map"] = {}
+                per_chat_hash["nick_map"][str(clicked_y)] = nickname
+                chat_key = nickname
+            per_chat_hash[chat_key] = last_msg_hash
             if result_type == 'ok':
                 chat_processed += 1
                 total_processed += 1
@@ -773,6 +794,9 @@ def main():
         if len(stall_tracker) > 50:
             oldest = min(stall_tracker.items(), key=lambda x: x[1])
             stall_tracker.pop(oldest[0], None)
+
+        if len(per_chat_hash) > 50:
+            per_chat_hash.pop(next(iter(per_chat_hash)), None)
 
         time.sleep(1)
         back_to_chat_list(hwnd)
