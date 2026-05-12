@@ -173,6 +173,7 @@ tr.dismissed td{opacity:.6}
     <div class="toolbar">
         <button class="btn-cats" onclick="openCatManager()">📂 分类管理</button>
         <a href="/export?{{ filter_query }}" class="btn-export">📥 导出 Excel</a>
+	        <a href="/export_rag" class="btn-export">📚 知识库导出</a>
         <a href="/logout" class="btn-export" style="font-size:13px">🚪 退出</a>
     </div>
 </div>
@@ -513,12 +514,8 @@ def index():
     page = max(int(request.args.get('page', 1)), 1)
     per_page = 50
 
-    df = float(date_from) if date_from else None
-    if df:
-        df = datetime.datetime.strptime(date_from, "%Y-%m-%d").timestamp()
-    dt = float(date_to) if date_to else None
-    if dt:
-        dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").timestamp() + 86399
+    df = datetime.datetime.strptime(date_from, "%Y-%m-%d").timestamp() if date_from else None
+    dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").timestamp() + 86399 if date_to else None
 
     result = stats.search_questions(
         keyword=keyword or None,
@@ -666,12 +663,8 @@ def export_excel():
     date_to = request.args.get('date_to', '')
     reply_status = request.args.get('reply_status', '')
 
-    df = float(date_from) if date_from else None
-    if df:
-        df = datetime.datetime.strptime(date_from, "%Y-%m-%d").timestamp()
-    dt = float(date_to) if date_to else None
-    if dt:
-        dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").timestamp() + 86399
+    df = datetime.datetime.strptime(date_from, "%Y-%m-%d").timestamp() if date_from else None
+    dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").timestamp() + 86399 if date_to else None
 
     export_dir = os.path.join(os.path.dirname(__file__), "exports")
     os.makedirs(export_dir, exist_ok=True)
@@ -685,6 +678,17 @@ def export_excel():
                        date_to=dt,
                        reply_status=reply_status or None)
 
+    return send_file(filepath, as_attachment=True, download_name=filename)
+
+
+@app.route('/export_rag')
+@login_required
+def export_rag():
+    export_dir = os.path.join(os.path.dirname(__file__), "exports")
+    os.makedirs(export_dir, exist_ok=True)
+    filename = f"rag_knowledge_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    filepath = os.path.join(export_dir, filename)
+    stats.export_rag_excel(filepath)
     return send_file(filepath, as_attachment=True, download_name=filename)
 
 

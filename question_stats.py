@@ -507,3 +507,17 @@ class QuestionStats:
             ws2.append(list(p))
 
         wb.save(filepath)
+
+    def export_rag_excel(self, filepath):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "知识库"
+        ws.append(["问题", "答案", "分类"])
+
+        pairs = self.export_qa_pairs()
+        for p in pairs:
+            category, question, answer, count = p
+            ws.append([question, answer, category])
+
+        wb.save(filepath)
