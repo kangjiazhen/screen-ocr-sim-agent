@@ -59,6 +59,14 @@ def init_db(db_path=None):
             enabled INTEGER DEFAULT 1,
             created_at REAL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at REAL DEFAULT 0,
+            updated_at REAL DEFAULT 0
+        );
         CREATE INDEX IF NOT EXISTS idx_questions_cluster_id ON questions(cluster_id);
         CREATE INDEX IF NOT EXISTS idx_clusters_category ON question_clusters(category);
     """)
@@ -70,7 +78,30 @@ def init_db(db_path=None):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_questions_status ON questions(status)")
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute("ALTER TABLE question_clusters ADD COLUMN is_timely INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE question_clusters ADD COLUMN last_edited REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("UPDATE questions SET status = 'replied' WHERE reply_body != '' AND (status = 'pending' OR status IS NULL)")
+    # 默认管理员账号
+    row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+    if row and row[0] == 0:
+        from werkzeug.security import generate_password_hash
+        pw = "admin123"
+        try:
+            from config import WEB_PASSWORD
+            pw = WEB_PASSWORD
+        except ImportError:
+            pass
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'admin', ?, ?)",
+            ("admin", generate_password_hash(pw), time.time(), time.time())
+        )
+        logging.info("[Stats] 默认管理员账户已创建 (admin)")
     conn.commit()
     conn.close()
     logging.info("[Stats] 数据库初始化完成")
@@ -291,7 +322,7 @@ class QuestionStats:
     def get_all_questions(self, limit=500, offset=0):
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute(
-            "SELECT q.id, qc.category, q.cleaned_text, q.nickname, q.reply_body, q.timestamp, qc.count, q.status "
+            "SELECT q.id, qc.category, q.cleaned_text, q.nickname, q.reply_body, q.timestamp, qc.count, q.status, qc.is_timely, qc.last_edited "
             "FROM questions q LEFT JOIN question_clusters qc ON q.cluster_id = qc.id "
             "ORDER BY q.timestamp DESC LIMIT ? OFFSET ?",
             (limit, offset)
@@ -395,8 +426,115 @@ class QuestionStats:
         conn.commit()
         conn.close()
 
+    # ============ 用户管理 ============
+    def get_users(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, username, role, created_at, updated_at FROM users ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_user_by_username(self, username):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def add_user(self, username, password_hash, role="user"):
+        conn = sqlite3.connect(self.db_path)
+        now = time.time()
+        try:
+            conn.execute(
+                "INSERT INTO users (username, password_hash, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (username.strip(), password_hash, role, now, now)
+            )
+            conn.commit()
+            return True, ""
+        except sqlite3.IntegrityError:
+            return False, "用户名已存在"
+        finally:
+            conn.close()
+
+    def update_user(self, user_id, username=None, password_hash=None, role=None):
+        conn = sqlite3.connect(self.db_path)
+        # 防止将最后一个管理员降级为普通用户
+        if role is not None and role != 'admin':
+            admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+            current = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+            if current and current[0] == 'admin' and admin_count <= 1:
+                conn.close()
+                return False, "不能将最后一个管理员降级为普通用户"
+        updates = []
+        params = []
+        if username is not None:
+            updates.append("username = ?")
+            params.append(username.strip())
+        if password_hash is not None:
+            updates.append("password_hash = ?")
+            params.append(password_hash)
+        if role is not None:
+            updates.append("role = ?")
+            params.append(role)
+        if updates:
+            updates.append("updated_at = ?")
+            params.append(time.time())
+            params.append(user_id)
+            conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+            conn.commit()
+        conn.close()
+        return True, ""
+
+    def delete_user(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        admin_count = conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0]
+        row = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            conn.close()
+            return False, "用户不存在"
+        if row[0] == 'admin' and admin_count <= 1:
+            conn.close()
+            return False, "不能删除最后一个管理员"
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        return True, ""
+
+    def delete_question(self, question_id):
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute("SELECT cluster_id FROM questions WHERE id = ?", (question_id,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+            conn.execute("UPDATE question_clusters SET count = count - 1 WHERE id = ?", (row[0],))
+            conn.commit()
+        conn.close()
+
+    def batch_set_status(self, ids, status):
+        conn = sqlite3.connect(self.db_path)
+        placeholders = ','.join('?' * len(ids))
+        conn.execute(f"UPDATE questions SET status = ? WHERE id IN ({placeholders})", [status] + ids)
+        conn.commit()
+        count = conn.total_changes
+        conn.close()
+        return count
+
+    def batch_delete_questions(self, ids):
+        conn = sqlite3.connect(self.db_path)
+        placeholders = ','.join('?' * len(ids))
+        # 更新 cluster count
+        rows = conn.execute(f"SELECT cluster_id FROM questions WHERE id IN ({placeholders})", ids).fetchall()
+        for (cid,) in rows:
+            conn.execute("UPDATE question_clusters SET count = count - 1 WHERE id = ?", (cid,))
+        conn.execute(f"DELETE FROM questions WHERE id IN ({placeholders})", ids)
+        conn.commit()
+        count = conn.total_changes
+        conn.close()
+        return count
+
     def search_questions(self, keyword=None, category=None, date_from=None, date_to=None,
-                         reply_status=None, limit=200, offset=0):
+                         reply_status=None, is_timely=None, limit=200, offset=0):
         conn = sqlite3.connect(self.db_path)
         conds = []
         params = []
@@ -418,6 +556,9 @@ class QuestionStats:
             conds.append("q.status = 'pending'")
         elif reply_status == "dismissed":
             conds.append("q.status = 'dismissed'")
+        if is_timely is not None:
+            conds.append("qc.is_timely = ?")
+            params.append(1 if is_timely else 0)
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
 
         count_row = conn.execute(
@@ -428,7 +569,7 @@ class QuestionStats:
 
         rows = conn.execute(
             f"SELECT q.id, qc.category, q.cleaned_text, q.nickname, q.reply_body, q.timestamp, "
-            f"qc.id as cluster_id, q.reply_full, q.status "
+            f"qc.id as cluster_id, q.reply_full, q.status, qc.is_timely, qc.last_edited "
             f"FROM questions q LEFT JOIN question_clusters qc ON q.cluster_id = qc.id"
             f"{where} ORDER BY q.timestamp DESC LIMIT ? OFFSET ?",
             params + [limit, offset]
@@ -438,22 +579,32 @@ class QuestionStats:
 
     def update_reply(self, question_id, reply_body):
         conn = sqlite3.connect(self.db_path)
+        now = time.time()
         conn.execute("UPDATE questions SET reply_body = ?, status = 'replied' WHERE id = ?", (reply_body, question_id))
         row = conn.execute("SELECT cluster_id FROM questions WHERE id = ?", (question_id,)).fetchone()
         if row:
             conn.execute(
-                "UPDATE question_clusters SET best_reply_body = ? WHERE id = ? AND (best_reply_body = '' OR best_reply_body IS NULL)",
-                (reply_body, row[0])
+                "UPDATE question_clusters SET best_reply_body = ?, last_edited = ? WHERE id = ? AND (best_reply_body = '' OR best_reply_body IS NULL)",
+                (reply_body, now, row[0])
             )
         conn.commit()
         conn.close()
 
     def update_cluster_reply(self, cluster_id, reply_body):
         conn = sqlite3.connect(self.db_path)
-        conn.execute("UPDATE question_clusters SET best_reply_body = ? WHERE id = ?", (reply_body, cluster_id))
+        now = time.time()
+        conn.execute("UPDATE question_clusters SET best_reply_body = ?, last_edited = ? WHERE id = ?", (reply_body, now, cluster_id))
         conn.execute("UPDATE questions SET reply_body = ?, status = 'replied' WHERE cluster_id = ?", (reply_body, cluster_id))
         conn.commit()
         conn.close()
+
+    def toggle_timely(self, cluster_id):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE question_clusters SET is_timely = 1 - is_timely WHERE id = ?", (cluster_id,))
+        conn.commit()
+        row = conn.execute("SELECT is_timely FROM question_clusters WHERE id = ?", (cluster_id,)).fetchone()
+        conn.close()
+        return row[0] if row else 0
 
     def set_question_status(self, question_id, status):
         conn = sqlite3.connect(self.db_path)
@@ -471,22 +622,22 @@ class QuestionStats:
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
             "SELECT q.id, qc.category, q.cleaned_text, q.nickname, q.reply_body, q.timestamp, "
-            "qc.id as cluster_id, q.reply_full, q.raw_text, q.status "
+            "qc.id as cluster_id, q.reply_full, q.raw_text, q.status, qc.is_timely, qc.last_edited "
             "FROM questions q LEFT JOIN question_clusters qc ON q.cluster_id = qc.id "
             "WHERE q.id = ?", (question_id,)
         ).fetchone()
         conn.close()
         return row
 
-    def export_excel(self, filepath, keyword=None, category=None, date_from=None, date_to=None, reply_status=None):
+    def export_excel(self, filepath, keyword=None, category=None, date_from=None, date_to=None, reply_status=None, is_timely=None):
         import openpyxl
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "问题统计"
-        ws.append(["ID", "分类", "问题", "昵称", "AI回复", "专业答复", "状态", "时间", "聚类ID"])
+        ws.append(["ID", "分类", "问题", "昵称", "AI回复", "专业答复", "状态", "时效性", "时间", "聚类ID"])
 
         STATUS_MAP = {"pending": "待答复", "replied": "已答复", "dismissed": "不予处理"}
-        result = self.search_questions(keyword, category, date_from, date_to, reply_status, limit=10000, offset=0)
+        result = self.search_questions(keyword, category, date_from, date_to, reply_status, is_timely, limit=10000, offset=0)
         for row in result["questions"]:
             timestamp = row[5]
             time_str = ""
@@ -498,7 +649,9 @@ class QuestionStats:
             _, coze_body = parse_coze_category(reply_full)
             reply_body = row[4] or ""
             status_text = STATUS_MAP.get(row[8], row[8] if len(row) > 8 else "pending")
-            ws.append([row[0], row[1] or "", row[2], row[3] or "", coze_body, reply_body, status_text, time_str, row[6] or ""])
+            is_timely = row[9] if len(row) > 9 else 0
+            timely_text = "高时效" if is_timely else "普通"
+            ws.append([row[0], row[1] or "", row[2], row[3] or "", coze_body, reply_body, status_text, timely_text, time_str, row[6] or ""])
 
         ws2 = wb.create_sheet("分类汇总")
         ws2.append(["分类", "代表提问", "专业答复", "次数"])
@@ -510,14 +663,30 @@ class QuestionStats:
 
     def export_rag_excel(self, filepath):
         import openpyxl
+        import datetime
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "知识库"
-        ws.append(["问题", "答案", "分类"])
+        ws.append(["问题", "答案", "分类", "高时效性", "最后编辑时间", "建议更新"])
 
-        pairs = self.export_qa_pairs()
-        for p in pairs:
-            category, question, answer, count = p
-            ws.append([question, answer, category])
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT category, representative_text, best_reply_body, count, is_timely, last_edited "
+            "FROM question_clusters WHERE best_reply_body != '' "
+            "ORDER BY count DESC"
+        ).fetchall()
+        conn.close()
+        now = time.time()
+        for row in rows:
+            category, question, answer, count, is_timely, last_edited = row
+            timely_label = "是" if is_timely else "否"
+            last_edited_str = ""
+            if last_edited:
+                dt = datetime.datetime.fromtimestamp(last_edited)
+                last_edited_str = dt.strftime("%Y-%m-%d %H:%M")
+            need_update = ""
+            if is_timely and last_edited and (now - last_edited) > 7 * 86400:
+                need_update = "建议更新"
+            ws.append([question, answer, category, timely_label, last_edited_str, need_update])
 
         wb.save(filepath)
