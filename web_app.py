@@ -334,7 +334,7 @@ tr.dismissed td{opacity:.6}
             <button class="close" onclick="closeEdit()">&times;</button>
         </div>
         <div class="modal-body">
-            <div class="field"><label>分类</label><div class="val" id="modalCategory">-</div></div>
+            <div class="field"><label>分类</label><select id="modalCategory" style="width:100%;padding:8px 12px;border:1px solid #d9d9d9;border-radius:6px;font-size:13px"><option value="">加载中...</option></select></div>
             <div class="field"><label>用户提问</label><div class="val" id="modalQuestion">-</div></div>
             <div class="field"><label>Coze 自动回复</label><div class="val" id="modalCozeReply" style="color:#888">-</div></div>
             <div class="field">
@@ -437,43 +437,54 @@ tr.dismissed td{opacity:.6}
 let currentQuestionId = null;
 let currentClusterId = null;
 let currentCozeReply = '';
+let currentCategory = '';
 const isAdmin = {{ 'true' if is_admin else 'false' }};
 
 function openEdit(id) {
     currentQuestionId = id;
     document.getElementById('editModal').classList.add('active');
-    fetch('/api/detail/' + id)
-        .then(r => r.json())
-        .then(d => {
-            if (d.ok) {
-                currentClusterId = d.data.cluster_id;
-                currentCozeReply = d.data.coze_body || d.data.coze_reply || '';
-                document.getElementById('modalCategory').innerText = d.data.category || '未分类';
-                document.getElementById('modalQuestion').innerText = d.data.question;
-                document.getElementById('modalCozeReply').innerText = currentCozeReply || '(无)';
-                document.getElementById('modalReply').value = d.data.reply_body || '';
-                document.getElementById('modalStatus').value = d.data.status || 'pending';
-                document.getElementById('applyToCluster').checked = false;
-                document.getElementById('modalIsTimely').checked = d.data.is_timely || false;
-                const lastEdited = d.data.last_edited;
-                const warnEl = document.getElementById('modalUpdateWarn');
-                const editedEl = document.getElementById('modalLastEdited');
-                if (lastEdited) {
-                    const dt = new Date(lastEdited * 1000);
-                    editedEl.innerText = '最后编辑: ' + dt.toLocaleString('zh-CN');
-                    editedEl.style.display = '';
-                    const now = Date.now() / 1000;
-                    if (d.data.is_timely && (now - lastEdited) > 604800) {
-                        warnEl.style.display = '';
-                    } else {
-                        warnEl.style.display = 'none';
-                    }
+    Promise.all([
+        fetch('/api/detail/' + id).then(r => r.json()),
+        fetch('/api/categories').then(r => r.json())
+    ]).then(([d, catData]) => {
+        if (d.ok) {
+            currentClusterId = d.data.cluster_id;
+            currentCozeReply = d.data.coze_body || d.data.coze_reply || '';
+            const catSelect = document.getElementById('modalCategory');
+            catSelect.innerHTML = '<option value="">未分类</option>';
+            const cats = catData.data || [];
+            cats.forEach(c => {
+                if (c.enabled) {
+                    catSelect.innerHTML += '<option value="' + esc(c.name) + '">' + esc(c.name) + '</option>';
+                }
+            });
+            catSelect.value = d.data.category || '';
+            currentCategory = d.data.category || '';
+            document.getElementById('modalQuestion').innerText = d.data.question;
+            document.getElementById('modalCozeReply').innerText = currentCozeReply || '(无)';
+            document.getElementById('modalReply').value = d.data.reply_body || '';
+            document.getElementById('modalStatus').value = d.data.status || 'pending';
+            document.getElementById('applyToCluster').checked = false;
+            document.getElementById('modalIsTimely').checked = d.data.is_timely || false;
+            const lastEdited = d.data.last_edited;
+            const warnEl = document.getElementById('modalUpdateWarn');
+            const editedEl = document.getElementById('modalLastEdited');
+            if (lastEdited) {
+                const dt = new Date(lastEdited * 1000);
+                editedEl.innerText = '最后编辑: ' + dt.toLocaleString('zh-CN');
+                editedEl.style.display = '';
+                const now = Date.now() / 1000;
+                if (d.data.is_timely && (now - lastEdited) > 604800) {
+                    warnEl.style.display = '';
                 } else {
                     warnEl.style.display = 'none';
-                    editedEl.style.display = 'none';
                 }
+            } else {
+                warnEl.style.display = 'none';
+                editedEl.style.display = 'none';
             }
-        }).catch(e => showToast('加载失败: '+e,'error'));
+        }
+    }).catch(e => showToast('加载失败: '+e,'error'));
 }
 
 function toggleTimely() {
@@ -505,6 +516,7 @@ function saveReply() {
     const reply = document.getElementById('modalReply').value;
     const status = document.getElementById('modalStatus').value;
     const applyAll = document.getElementById('applyToCluster').checked;
+    const newCategory = document.getElementById('modalCategory').value;
 
     let url = '/api/reply/' + currentQuestionId;
     let payload = {reply_body: reply, status: status};
@@ -515,11 +527,25 @@ function saveReply() {
     fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     .then(r => r.json())
     .then(d => {
-        if (d.ok) {
+        if (!d.ok) { showToast('❌ ' + (d.error || '失败'), 'error'); return; }
+        if (newCategory && newCategory !== currentCategory) {
+            fetch('/api/question/' + currentQuestionId + '/category', {
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({category: newCategory})
+            }).then(r2 => r2.json()).then(d2 => {
+                if (d2.ok) {
+                    showToast('✅ 保存成功' + (applyAll ? '，已同步到整个分类' : ''));
+                } else {
+                    showToast('⚠️ 答复已保存，但分类更新失败: ' + (d2.error || ''));
+                }
+                closeEdit();
+                setTimeout(() => location.reload(), 600);
+            });
+        } else {
             showToast('✅ 保存成功' + (applyAll ? '，已同步到整个分类' : ''));
             closeEdit();
             setTimeout(() => location.reload(), 600);
-        } else { showToast('❌ ' + (d.error || '失败'), 'error'); }
+        }
     }).catch(e => showToast('❌ 请求失败: ' + e, 'error'));
 }
 
@@ -980,6 +1006,19 @@ def api_delete_question(question_id):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route('/api/question/<int:question_id>/category', methods=['POST'])
+@login_required
+def api_update_question_category(question_id):
+    data = request.get_json()
+    new_category = data.get('category', '').strip()
+    if not new_category:
+        return jsonify({"ok": False, "error": "分类不能为空"})
+    ok = stats.update_question_category(question_id, new_category)
+    if ok:
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "问题不存在"})
 
 
 @app.route('/api/categories')

@@ -511,6 +511,32 @@ class QuestionStats:
             conn.commit()
         conn.close()
 
+    def update_question_category(self, question_id, new_category):
+        conn = sqlite3.connect(self.db_path)
+        old = conn.execute("SELECT cluster_id FROM questions WHERE id = ?", (question_id,)).fetchone()
+        if not old:
+            conn.close()
+            return False
+        new_category = new_category.strip()
+        row = conn.execute("SELECT id FROM question_clusters WHERE category = ?", (new_category,)).fetchone()
+        if row:
+            new_cluster_id = row[0]
+        else:
+            now = time.time()
+            cur = conn.execute(
+                "INSERT INTO question_clusters (category, count, first_seen, last_seen) VALUES (?, 0, ?, ?)",
+                (new_category, now, now)
+            )
+            new_cluster_id = cur.lastrowid
+        conn.execute("UPDATE questions SET cluster_id = ?, category = ? WHERE id = ?",
+                     (new_cluster_id, new_category, question_id))
+        conn.execute("UPDATE question_clusters SET count = count - 1 WHERE id = ?", (old[0],))
+        conn.execute("UPDATE question_clusters SET count = count + 1, last_seen = ? WHERE id = ?",
+                     (time.time(), new_cluster_id))
+        conn.commit()
+        conn.close()
+        return True
+
     def batch_set_status(self, ids, status):
         conn = sqlite3.connect(self.db_path)
         placeholders = ','.join('?' * len(ids))

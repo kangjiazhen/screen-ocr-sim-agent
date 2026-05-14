@@ -4,11 +4,10 @@
 ========================================
 变更:
   - ★ 修复多红点场景第二个红点被漏处理 — 主循环移除 back_to_chat_list 硬编码点击
-  - ★ 修复同一消息被重复回复 — stall=99 永久标记 + Y轴±8px 容差匹配
   - ★ 修复点击红点B却读取红点A的聊天内容 — snap_hash 校验聊天是否真实切换
   - ★ 红点处理改为 Y 轴最高优先 → reversed(clusters)
   - ★ 主循环简化 — 每轮一个红点，处理完回到顶部重新扫描，不再硬编码导航
-  - back_to_chat_list 改为标题栏安全点击，避免 Esc 退出微信 / 坐标误触聊天项
+  - back_to_chat_list 改为点击侧边栏安全区域，避免标题栏按钮误触
 ========================================
 """
 import sys
@@ -45,6 +44,7 @@ except ImportError:
 
 from config import (
     AI_BACKEND,
+    COZE_ENABLED,
     WAKE_WORD,
     WECHAT_PATH,
     COZE_API_TOKEN, BOT_ID,
@@ -333,32 +333,18 @@ def find_red_dot_clusters(hwnd):
     return []
 
 
-STALL_Y_TOLERANCE = 8
-
-def _get_stall(stall_tracker, y):
-    for tracked_y, count in stall_tracker.items():
-        if abs(tracked_y - y) <= STALL_Y_TOLERANCE:
-            return count
-    return 0
-
-def click_red_dot(hwnd, stall_tracker):
+def click_red_dot(hwnd):
     clusters = find_red_dot_clusters(hwnd)
     if not clusters:
         return False, None
 
     for cx, cy, pc in reversed(clusters):
-        stall_count = _get_stall(stall_tracker, cy)
-        if stall_count >= 3:
-            logging.info(f"[红点] 跳过簇 ({cx},{cy}) —— stall={stall_count}")
-            continue
-
         pyautogui.moveTo(cx, cy, duration=0.1)
         pyautogui.click()
-        logging.info(f"[红点] 点击簇 ({cx}, {cy}) 像素={pc}  stall={stall_count}")
+        logging.info(f"[红点] 点击簇 ({cx}, {cy}) 像素={pc}")
         time.sleep(0.8)
         return True, cy
 
-    logging.info("[红点] 所有簇均处于stall状态，跳过")
     return False, None
 
 
@@ -756,9 +742,12 @@ def send_mention_reply(hwnd, nickname, text):
 
 
 def back_to_chat_list(hwnd):
+    """点击左侧聊天列表安全区域返回焦点，避开标题栏按钮"""
     l, t, r, b = get_rect(hwnd)
     w = r - l
-    pyautogui.click(l + w // 2, t + 8)
+    h = b - t
+    # 点击左侧8%宽度、50%高度位置，位于聊天列表深处，不会碰到标题栏按钮
+    pyautogui.click(l + int(w * 0.08), t + int(h * 0.5))
     time.sleep(0.3)
 
 
@@ -788,6 +777,15 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         if not question:
             question = "你好"
         logging.info(f"[触发] 唤醒词匹配，提问: {question}")
+
+        if not COZE_ENABLED:
+            try:
+                _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
+            except Exception:
+                pass
+            logging.info("[采集] Coze已关闭，问题已入库（未分类）")
+            return 'ok', mh, nickname
+
         reply, ok = ai_reply(question, chat_user_id)
         reply_body = parse_coze_category(reply)[1] if reply else ""
         if reply and ok:
@@ -843,7 +841,6 @@ def main():
     pyautogui.PAUSE = 0.2
     pyautogui.FAILSAFE = False
 
-    stall_tracker = {}
     per_chat_hash = {}
     last_snap_hash = ""
     no_red_dot_count = 0
@@ -875,7 +872,6 @@ def main():
                 if new_hwnd:
                     hwnd = new_hwnd
                     restore_wechat_window(hwnd)
-                    stall_tracker.clear()
                     per_chat_hash.clear()
                     no_red_dot_count = 0
                     logging.info("[窗口] 微信窗口已恢复，状态已重置")
@@ -894,11 +890,10 @@ def main():
 
         def handle_current_chat():
             nonlocal total_processed, last_processed_chat_hash
-            cid = f"wx-{clicked_y}" if clicked_y else "wx-default"
-            ckey = per_chat_hash.get("nick_map", {}).get(str(clicked_y), cid)
-            mh = per_chat_hash.get(ckey, "")
+            # 用 clicked_y 生成唯一会话ID，避免昵称冲突导致跨会话去重污染
+            chat_key = f"chat-y{clicked_y}" if clicked_y else "chat-default"
+            mh = per_chat_hash.get(chat_key, "")
             processed = 0
-            text_seen = False
             first_sh = snap_hash(hwnd)
             if first_sh == last_processed_chat_hash and last_processed_chat_hash:
                 logging.info("[切换] 聊天未切换，停留在上次会话，跳过")
@@ -912,38 +907,20 @@ def main():
                         break
                 last_sh = snap_hash(hwnd)
 
-                rt, mh, nick = process_one_message(hwnd, mh, cid)
-                if nick:
-                    if "nick_map" not in per_chat_hash:
-                        per_chat_hash["nick_map"] = {}
-                    per_chat_hash["nick_map"][str(clicked_y)] = nick
-                    ckey = nick
-                per_chat_hash[ckey] = mh
+                rt, mh, nick = process_one_message(hwnd, mh, chat_key)
+                per_chat_hash[chat_key] = mh
                 if rt == 'ok':
                     processed += 1
                     total_processed += 1
-                    text_seen = True
                     logging.info(f"[统计] 本轮第{_pass+1}条 | 累计={total_processed}")
-                    break
                 elif rt == 'no_text':
-                    text_seen = False
                     break
                 else:
                     break
 
-            if processed > 0:
-                stall_tracker[clicked_y] = 99
-                logging.info(f"[Stall] Y={clicked_y} 处理{processed}条，标记完成")
-            elif text_seen:
-                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 1
-                logging.info(f"[Stall] Y={clicked_y} 有文字但未触发，stall={stall_tracker[clicked_y]}/3")
-            else:
-                stall_tracker[clicked_y] = stall_tracker.get(clicked_y, 0) + 2
-                logging.info(f"[Stall] Y={clicked_y} 无文字(异常消息)，stall+2={stall_tracker[clicked_y]}/3")
-
             last_processed_chat_hash = snap_hash(hwnd)
 
-        clicked, clicked_y = click_red_dot(hwnd, stall_tracker)
+        clicked, clicked_y = click_red_dot(hwnd)
         if not clicked:
             no_red_dot_count += 1
             if no_red_dot_count >= NO_RED_DOT_FALLBACK:
@@ -960,9 +937,6 @@ def main():
         last_activity_time = time.time()
 
         handle_current_chat()
-
-        if len(stall_tracker) > 50:
-            stall_tracker.pop(next(iter(stall_tracker)), None)
 
         if len(per_chat_hash) > 50:
             per_chat_hash.pop(next(iter(per_chat_hash)), None)
