@@ -772,41 +772,43 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         logging.info("[去重] 当前会话消息重复")
         return 'duplicate', last_msg_hash, nickname
 
-    if WAKE_WORD in msg:
-        question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip()
-        if not question:
-            question = "你好"
-        logging.info(f"[触发] 唤醒词匹配，提问: {question}")
-
-        if not COZE_ENABLED:
-            try:
-                _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
-            except Exception:
-                pass
-            logging.info("[采集] Coze已关闭，问题已入库（未分类）")
-            return 'ok', mh, nickname
-
-        reply, ok = ai_reply(question, chat_user_id)
-        reply_body = parse_coze_category(reply)[1] if reply else ""
-        if reply and ok:
-            try:
-                _stats.record(question, nickname=nickname or "", reply_full=reply, chat_user_id=chat_user_id)
-            except Exception:
-                pass
-            send_text = reply_body or reply
-            if nickname:
-                send_mention_reply(hwnd, nickname, send_text)
-                logging.info(f"[@] 真实@「{nickname}」回复")
-            else:
-                send_message(hwnd, send_text)
-        elif not ok:
-            logging.warning(f"[AI] {AI_BACKEND} 请求失败，跳过回复")
-        else:
-            send_message(hwnd, "抱歉，暂时无法回答")
-        return 'ok', mh, nickname
-    else:
-        logging.info("[跳过] 未包含唤醒词")
+    # 群聊需要唤醒词，私聊直接触发
+    if nickname and WAKE_WORD not in msg:
+        logging.info("[跳过] 群聊未包含唤醒词")
         return 'no_wake', last_msg_hash, nickname
+
+    question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip() if WAKE_WORD in msg else msg
+    if not question:
+        question = "你好"
+    is_group = bool(nickname)
+    logging.info(f"[触发] {'群聊' if is_group else '私聊'}，提问: {question}")
+
+    if not COZE_ENABLED:
+        try:
+            _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
+        except Exception:
+            pass
+        logging.info("[采集] Coze已关闭，问题已入库（未分类）")
+        return 'ok', mh, nickname
+
+    reply, ok = ai_reply(question, chat_user_id)
+    reply_body = parse_coze_category(reply)[1] if reply else ""
+    if reply and ok:
+        try:
+            _stats.record(question, nickname=nickname or "", reply_full=reply, chat_user_id=chat_user_id)
+        except Exception:
+            pass
+        send_text = reply_body or reply
+        if nickname:
+            send_mention_reply(hwnd, nickname, send_text)
+            logging.info(f"[@] 真实@「{nickname}」回复")
+        else:
+            send_message(hwnd, send_text)
+    elif not ok:
+        logging.warning(f"[AI] {AI_BACKEND} 请求失败，跳过回复")
+    else:
+        send_message(hwnd, "抱歉，暂时无法回答")
+    return 'ok', mh, nickname
 
 
 # ==================== 主循环 ====================
