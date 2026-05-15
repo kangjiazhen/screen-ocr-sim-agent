@@ -67,6 +67,7 @@ ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
 _ocr = None
 _stats = None
+_ocr_cache = {"text": "", "nickname": ""}  # 防止无新消息时重复入库
 
 def init_ocr():
     global _ocr
@@ -396,7 +397,8 @@ def get_latest_bubble_text(hwnd):
 
     crop_y1 = chat_y1 + max(top_y - 45, 0)
     crop_y2 = chat_y1 + bottom_y + 20
-    crop_x1 = int(w * 0.08)
+    # 消息气泡区域在窗口右侧，避开左侧聊天列表栏
+    crop_x1 = int(w * 0.35)
     crop_x2 = int(w * 0.79)
 
     crop_h = crop_y2 - crop_y1
@@ -441,18 +443,19 @@ def get_latest_bubble_text(hwnd):
 
     raw_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     nickname = ""
+    # 从底部向上检测：最后一行是最新消息，倒数第二行可能是发送者昵称
+    # 避免上方旧消息被误判为昵称
     if len(raw_lines) >= 2:
-        first = raw_lines[0]
-        second = raw_lines[1]
-        first_zh = sum(1 for c in first if '\u4e00' <= c <= '\u9fff')
-        first_alpha = sum(1 for c in first if c.isalpha())
-        second_zh = sum(1 for c in second if '\u4e00' <= c <= '\u9fff')
-        second_alpha = sum(1 for c in second if c.isalpha())
-        second_len = len(second)
-        is_short_nick = len(first) <= 8 and (first_zh + first_alpha) >= 1
-        second_is_content = (second_zh + second_alpha >= 3) or second_len > 10 or WAKE_WORD in second
-        if is_short_nick and second_is_content:
-            nickname = first
+        prev_line = raw_lines[-2]
+        last_line = raw_lines[-1]
+        prev_zh = sum(1 for c in prev_line if '\u4e00' <= c <= '\u9fff')
+        prev_alpha = sum(1 for c in prev_line if c.isalpha())
+        last_zh = sum(1 for c in last_line if '\u4e00' <= c <= '\u9fff')
+        last_alpha = sum(1 for c in last_line if c.isalpha())
+        is_short_nick = len(prev_line) <= 8 and (prev_zh + prev_alpha) >= 1
+        last_is_content = (last_zh + last_alpha >= 3) or len(last_line) > 10 or WAKE_WORD in last_line
+        if is_short_nick and last_is_content:
+            nickname = prev_line
             logging.info(f"  [昵称] 提取到: 「{nickname}」")
 
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
@@ -767,12 +770,29 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
         logging.info(f"👤 发送者: {nickname}")
     logging.info(f"📩 收到消息: {msg}")
 
+    global _ocr_cache
+    if msg == _ocr_cache["text"] and nickname == _ocr_cache["nickname"]:
+        logging.info("[缓存] OCR结果与上次相同，跳过")
+        return 'duplicate', last_msg_hash, nickname
+    _ocr_cache["text"] = msg
+    _ocr_cache["nickname"] = nickname or ""
+
     mh = hashlib.md5(msg.encode()).hexdigest()[:8]
     if mh == last_msg_hash:
         logging.info("[去重] 当前会话消息重复")
         return 'duplicate', last_msg_hash, nickname
 
-    # 群聊需要唤醒词，私聊直接触发
+    # 采集模式：跳过唤醒词检查，所有消息直接入库
+    if not COZE_ENABLED:
+        question = msg
+        logging.info(f"[采集] {'私聊' if not nickname else '群聊'} 入库: {question[:60]}")
+        try:
+            _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
+        except Exception:
+            pass
+        return 'ok', mh, nickname
+
+    # 回复模式：群聊需要唤醒词，私聊直接触发
     if nickname and WAKE_WORD not in msg:
         logging.info("[跳过] 群聊未包含唤醒词")
         return 'no_wake', last_msg_hash, nickname
@@ -780,16 +800,7 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
     question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip() if WAKE_WORD in msg else msg
     if not question:
         question = "你好"
-    is_group = bool(nickname)
-    logging.info(f"[触发] {'群聊' if is_group else '私聊'}，提问: {question}")
-
-    if not COZE_ENABLED:
-        try:
-            _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
-        except Exception:
-            pass
-        logging.info("[采集] Coze已关闭，问题已入库（未分类）")
-        return 'ok', mh, nickname
+    logging.info(f"[触发] {'群聊' if nickname else '私聊'}，提问: {question}")
 
     reply, ok = ai_reply(question, chat_user_id)
     reply_body = parse_coze_category(reply)[1] if reply else ""
