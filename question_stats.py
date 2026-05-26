@@ -502,6 +502,21 @@ class QuestionStats:
         conn.close()
         return True, ""
 
+    def update_question_text(self, question_id, new_text):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE questions SET raw_text = ?, cleaned_text = ? WHERE id = ?",
+            (new_text, new_text, question_id)
+        )
+        row = conn.execute("SELECT cluster_id FROM questions WHERE id = ?", (question_id,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE question_clusters SET representative_text = ? WHERE id = ? AND representative_text = ''",
+                (new_text, row[0])
+            )
+        conn.commit()
+        conn.close()
+
     def delete_question(self, question_id):
         conn = sqlite3.connect(self.db_path)
         row = conn.execute("SELECT cluster_id FROM questions WHERE id = ?", (question_id,)).fetchone()

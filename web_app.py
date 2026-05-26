@@ -258,7 +258,6 @@ tr.dismissed td{opacity:.6}
                 <th>ID</th>
                 <th>分类</th>
                 <th>提问内容</th>
-                <th>昵称</th>
                 <th>Coze答复</th>
                 <th>专业答复</th>
                 <th>状态</th>
@@ -275,7 +274,6 @@ tr.dismissed td{opacity:.6}
                 <td>{{ row[0] }}</td>
                 <td>{% if row[1] %}<span class="badge cat">{{ row[1] }}</span>{% else %}<span class="badge nocat">未分类</span>{% endif %}</td>
                 <td title="{{ row[2] }}">{{ row[2][:50] }}{% if row[2]|length > 50 %}...{% endif %}</td>
-                <td>{{ row[3] or '-' }}</td>
                 <td title="{{ (row[7]|strip_category) or '' }}">{% set coze_text = row[7]|strip_category %}{% if coze_text %}{{ coze_text[:50] }}{% if coze_text|length > 50 %}...{% endif %}{% else %}<span style="color:#ccc">-</span>{% endif %}</td>
                 <td class="reply-cell" onclick="openEdit({{ row[0] }})" title="点击编辑">
                     {% if row[4] %}<span>{{ row[4][:40] }}{% if row[4]|length > 40 %}...{% endif %}</span>
@@ -303,7 +301,7 @@ tr.dismissed td{opacity:.6}
             </tr>
             {% endfor %}
             {% else %}
-            <tr><td colspan="11" class="empty-state"><div class="icon">📭</div>暂无数据 — bot.py 运行后会自动采集</td></tr>
+            <tr><td colspan="10" class="empty-state"><div class="icon">📭</div>暂无数据 — bot.py 运行后会自动采集</td></tr>
             {% endif %}
         </tbody>
     </table>
@@ -335,7 +333,7 @@ tr.dismissed td{opacity:.6}
         </div>
         <div class="modal-body">
             <div class="field"><label>分类</label><select id="modalCategory" style="width:100%;padding:8px 12px;border:1px solid #d9d9d9;border-radius:6px;font-size:13px"><option value="">加载中...</option></select></div>
-            <div class="field"><label>用户提问</label><div class="val" id="modalQuestion">-</div></div>
+            <div class="field"><label>用户提问</label><textarea id="modalQuestion" style="width:100%;min-height:60px;border:1px solid #d9d9d9;border-radius:6px;padding:10px;font-size:13px;resize:vertical;font-family:inherit"></textarea></div>
             <div class="field"><label>Coze 自动回复</label><div class="val" id="modalCozeReply" style="color:#888">-</div></div>
             <div class="field">
                 <label>专业答复 <span style="color:#999;font-weight:400">(人工补充，存入 RAG 知识库)</span></label>
@@ -438,6 +436,7 @@ let currentQuestionId = null;
 let currentClusterId = null;
 let currentCozeReply = '';
 let currentCategory = '';
+let currentQuestionText = '';
 const isAdmin = {{ 'true' if is_admin else 'false' }};
 
 function openEdit(id) {
@@ -460,7 +459,8 @@ function openEdit(id) {
             });
             catSelect.value = d.data.category || '';
             currentCategory = d.data.category || '';
-            document.getElementById('modalQuestion').innerText = d.data.question;
+            document.getElementById('modalQuestion').value = d.data.question;
+            currentQuestionText = d.data.question;
             document.getElementById('modalCozeReply').innerText = currentCozeReply || '(无)';
             document.getElementById('modalReply').value = d.data.reply_body || '';
             document.getElementById('modalStatus').value = d.data.status || 'pending';
@@ -517,6 +517,7 @@ function saveReply() {
     const status = document.getElementById('modalStatus').value;
     const applyAll = document.getElementById('applyToCluster').checked;
     const newCategory = document.getElementById('modalCategory').value;
+    const newQuestion = document.getElementById('modalQuestion').value.trim();
 
     let url = '/api/reply/' + currentQuestionId;
     let payload = {reply_body: reply, status: status};
@@ -524,28 +525,39 @@ function saveReply() {
         url = '/api/cluster_reply/' + currentClusterId;
     }
 
+    function doCategory() {
+        if (newCategory && newCategory !== currentCategory) {
+            return fetch('/api/question/' + currentQuestionId + '/category', {
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({category: newCategory})
+            }).then(r2 => r2.json()).then(d2 => {
+                if (!d2.ok) { showToast('⚠️ 答复已保存，但分类更新失败: ' + (d2.error || ''), 'error'); }
+            });
+        }
+        return Promise.resolve();
+    }
+
+    function doQuestion() {
+        if (newQuestion && newQuestion !== currentQuestionText) {
+            return fetch('/api/question/' + currentQuestionId + '/update', {
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({question: newQuestion})
+            }).then(r3 => r3.json()).then(d3 => {
+                if (!d3.ok) { showToast('⚠️ 答复已保存，但问题文本更新失败: ' + (d3.error || ''), 'error'); }
+            });
+        }
+        return Promise.resolve();
+    }
+
     fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     .then(r => r.json())
     .then(d => {
         if (!d.ok) { showToast('❌ ' + (d.error || '失败'), 'error'); return; }
-        if (newCategory && newCategory !== currentCategory) {
-            fetch('/api/question/' + currentQuestionId + '/category', {
-                method:'POST',headers:{'Content-Type':'application/json'},
-                body:JSON.stringify({category: newCategory})
-            }).then(r2 => r2.json()).then(d2 => {
-                if (d2.ok) {
-                    showToast('✅ 保存成功' + (applyAll ? '，已同步到整个分类' : ''));
-                } else {
-                    showToast('⚠️ 答复已保存，但分类更新失败: ' + (d2.error || ''));
-                }
-                closeEdit();
-                setTimeout(() => location.reload(), 600);
-            });
-        } else {
+        Promise.all([doCategory(), doQuestion()]).then(() => {
             showToast('✅ 保存成功' + (applyAll ? '，已同步到整个分类' : ''));
             closeEdit();
             setTimeout(() => location.reload(), 600);
-        }
+        });
     }).catch(e => showToast('❌ 请求失败: ' + e, 'error'));
 }
 
@@ -996,6 +1008,20 @@ def api_update_user(user_id):
 def api_delete_user(user_id):
     ok, err = stats.delete_user(user_id)
     return jsonify({"ok": ok, "error": err if not ok else ""})
+
+
+@app.route('/api/question/<int:question_id>/update', methods=['POST'])
+@login_required
+def api_update_question(question_id):
+    data = request.get_json()
+    question = data.get('question', '').strip()
+    if not question:
+        return jsonify({"ok": False, "error": "问题内容不能为空"})
+    try:
+        stats.update_question_text(question_id, question)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route('/api/question/<int:question_id>/delete', methods=['POST'])

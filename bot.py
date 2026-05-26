@@ -67,7 +67,7 @@ ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
 _ocr = None
 _stats = None
-_ocr_cache = {"text": "", "nickname": ""}  # 防止无新消息时重复入库
+_ocr_cache = {"text": ""}  # 防止无新消息时重复入库
 
 def init_ocr():
     global _ocr
@@ -428,41 +428,50 @@ def get_latest_bubble_text(hwnd):
         logging.info("[OCR] PaddleOCR 未检测到文字")
         return "", ""
 
-    lines = []
+    ocr_texts = []
     for item in ocr_result:
         rec_texts = item.get("rec_texts", [])
         rec_scores = item.get("rec_scores", [])
+        dt_polys = item.get("dt_polys", [])
         for i, text in enumerate(rec_texts):
             conf = rec_scores[i] if i < len(rec_scores) else 0
-            if text.strip():
-                lines.append(text.strip())
-                logging.info(f"  [OCR] 片段: 「{text}」 置信度={conf:.2f}")
+            if text.strip() and conf >= 0.85:
+                y_center = 0
+                box_height = 0
+                if i < len(dt_polys):
+                    poly = dt_polys[i]
+                    if poly is not None and len(poly) >= 4:
+                        try:
+                            ys = [float(p[1]) for p in poly if len(p) >= 2]
+                            if ys:
+                                y_center = sum(ys) / len(ys)
+                                box_height = max(ys) - min(ys)
+                        except Exception:
+                            pass
+                ocr_texts.append((y_center, box_height, text.strip()))
+                logging.info(f"  [OCR] 片段: 「{text}」 置信度={conf:.2f} Y={y_center:.0f} H={box_height:.0f}")
+            elif text.strip():
+                logging.info(f"  [OCR] 丢弃低置信度片段: 「{text}」 置信度={conf:.2f}")
 
-    raw = "\n".join(lines)
-    logging.info(f"  [OCR] 原始输出: 「{raw[:80]}...」" if len(raw) > 80 else f"  [OCR] 原始输出: 「{raw}」")
+    ocr_texts.sort(key=lambda x: x[0])
 
-    raw_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    nickname = ""
-    # 从底部向上检测：最后一行是最新消息，倒数第二行可能是发送者昵称
-    # 避免上方旧消息被误判为昵称
-    if len(raw_lines) >= 2:
-        prev_line = raw_lines[-2]
-        last_line = raw_lines[-1]
-        prev_zh = sum(1 for c in prev_line if '\u4e00' <= c <= '\u9fff')
-        prev_alpha = sum(1 for c in prev_line if c.isalpha())
-        last_zh = sum(1 for c in last_line if '\u4e00' <= c <= '\u9fff')
-        last_alpha = sum(1 for c in last_line if c.isalpha())
-        is_short_nick = len(prev_line) <= 8 and (prev_zh + prev_alpha) >= 1
-        last_is_content = (last_zh + last_alpha >= 3) or len(last_line) > 10 or WAKE_WORD in last_line
-        if is_short_nick and last_is_content:
-            nickname = prev_line
-            logging.info(f"  [昵称] 提取到: 「{nickname}」")
+    if len(ocr_texts) >= 2:
+        heights = [t[1] for t in ocr_texts]
+        max_h = max(heights)
+        min_h = min(heights)
+        if max_h > 0 and min_h > 0 and max_h >= min_h * 1.5:
+            msg_texts = [t for t in ocr_texts if t[1] >= max_h * 0.7]
+            logging.info(f"  [过滤] 群聊: 排除昵称文本(H={min_h:.0f}), 保留消息(H={max_h:.0f})")
+            raw = "\n".join(t[2] for t in msg_texts)
+        else:
+            raw = "\n".join(t[2] for t in ocr_texts)
+    else:
+        raw = "\n".join(t[2] for t in ocr_texts)
+    logging.info(f"  [OCR] 输出: 「{raw[:80]}...」" if len(raw) > 80 else f"  [OCR] 输出: 「{raw}」")
 
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     clean = []
     for ln in lines:
-        if nickname and ln == nickname:
-            continue
         zh = sum(1 for c in ln if '\u4e00' <= c <= '\u9fff')
         alpha = sum(1 for c in ln if c.isalpha())
         digit = sum(1 for c in ln if c.isdigit())
@@ -471,13 +480,6 @@ def get_latest_bubble_text(hwnd):
                 ln = re.sub(r'^[a-zA-Z0-9 _\-\.]+(?=[\u4e00-\u9fff])', '', ln).strip()
             if ln:
                 clean.append(ln)
-
-    def is_nickname_line(s):
-        stripped = s.strip()
-        return (len(stripped) <= 6
-                and all(c.isalpha() or c.isspace() for c in stripped)
-                and sum(1 for c in stripped if '\u4e00' <= c <= '\u9fff') == 0)
-    clean = [ln for ln in clean if not is_nickname_line(ln)]
 
     merged = []
     for ln in clean:
@@ -495,7 +497,7 @@ def get_latest_bubble_text(hwnd):
     result = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', result)
     result = re.sub(r'@\s+(?=[\u4e00-\u9fff])', '@', result)
 
-    return result, nickname
+    return result, ""
 
 
 # ==================== AI 后端（v29：可插拔） ====================
@@ -711,39 +713,6 @@ def send_message(hwnd, text):
     time.sleep(0.2)
 
 
-def send_mention_reply(hwnd, nickname, text):
-    """通过微信 @面板 真实 @某人 + 回复"""
-    ensure_visible(hwnd)
-    l, t, r, b = get_rect(hwnd)
-    w, h = r - l, b - t
-    input_x = l + int(w * 0.60)
-    input_y = t + int(h * 0.88)
-
-    bring_to_front(hwnd)
-    pyautogui.click(input_x, input_y)
-    time.sleep(0.3)
-
-    pyautogui.press('@')
-    time.sleep(0.4)
-
-    pyperclip.copy(nickname)
-    pyautogui.hotkey('ctrl', 'v')
-    time.sleep(0.3)
-
-    pyautogui.press('enter')
-    time.sleep(0.3)
-
-    pyperclip.copy(text)
-    pyautogui.hotkey('ctrl', 'v')
-    time.sleep(0.25)
-
-    pyautogui.press('enter')
-    time.sleep(0.35)
-
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
-    time.sleep(0.2)
-
-
 def back_to_chat_list(hwnd):
     """点击左侧聊天列表安全区域返回焦点，避开标题栏按钮"""
     l, t, r, b = get_rect(hwnd)
@@ -760,66 +729,56 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
     pyautogui.press('end')
     time.sleep(0.6)
 
-    msg, nickname = get_latest_bubble_text(hwnd)
+    msg, _ = get_latest_bubble_text(hwnd)
     if not msg:
         logging.info("[处理] 未识别到文字 → 可能是图片/语音/视频")
-        return 'no_text', last_msg_hash, nickname
+        return 'no_text', last_msg_hash
 
-    if nickname:
-        nickname = re.sub(r'@\S+$', '', nickname).strip()
-        logging.info(f"👤 发送者: {nickname}")
-    logging.info(f"📩 收到消息: {msg}")
+    logging.info(f" 收到消息: {msg}")
 
     global _ocr_cache
-    if msg == _ocr_cache["text"] and nickname == _ocr_cache["nickname"]:
+    if msg == _ocr_cache["text"]:
         logging.info("[缓存] OCR结果与上次相同，跳过")
-        return 'duplicate', last_msg_hash, nickname
+        return 'duplicate', last_msg_hash
     _ocr_cache["text"] = msg
-    _ocr_cache["nickname"] = nickname or ""
 
     mh = hashlib.md5(msg.encode()).hexdigest()[:8]
     if mh == last_msg_hash:
         logging.info("[去重] 当前会话消息重复")
-        return 'duplicate', last_msg_hash, nickname
+        return 'duplicate', last_msg_hash
 
-    # 采集模式：跳过唤醒词检查，所有消息直接入库
     if not COZE_ENABLED:
         question = msg
-        logging.info(f"[采集] {'私聊' if not nickname else '群聊'} 入库: {question[:60]}")
+        logging.info(f"[采集] 入库: {question[:60]}")
         try:
-            _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
+            _stats.record(question, nickname="", reply_full="", chat_user_id=chat_user_id)
         except Exception:
             pass
-        return 'ok', mh, nickname
-
-    # 回复模式：群聊需要唤醒词，私聊直接触发
-    if nickname and WAKE_WORD not in msg:
-        logging.info("[跳过] 群聊未包含唤醒词")
-        return 'no_wake', last_msg_hash, nickname
+        return 'ok', mh
 
     question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip() if WAKE_WORD in msg else msg
+    if WAKE_WORD not in msg:
+        logging.info("[跳过] 未包含唤醒词")
+        return 'no_wake', last_msg_hash
+
     if not question:
         question = "你好"
-    logging.info(f"[触发] {'群聊' if nickname else '私聊'}，提问: {question}")
+    logging.info(f"[触发] 提问: {question}")
 
     reply, ok = ai_reply(question, chat_user_id)
     reply_body = parse_coze_category(reply)[1] if reply else ""
     if reply and ok:
         try:
-            _stats.record(question, nickname=nickname or "", reply_full=reply, chat_user_id=chat_user_id)
+            _stats.record(question, nickname="", reply_full=reply, chat_user_id=chat_user_id)
         except Exception:
             pass
         send_text = reply_body or reply
-        if nickname:
-            send_mention_reply(hwnd, nickname, send_text)
-            logging.info(f"[@] 真实@「{nickname}」回复")
-        else:
-            send_message(hwnd, send_text)
+        send_message(hwnd, send_text)
     elif not ok:
         logging.warning(f"[AI] {AI_BACKEND} 请求失败，跳过回复")
     else:
         send_message(hwnd, "抱歉，暂时无法回答")
-    return 'ok', mh, nickname
+    return 'ok', mh
 
 
 # ==================== 主循环 ====================
