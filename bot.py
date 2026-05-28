@@ -1,13 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-微信智能机器人 v1.0.32
+企业微信智能机器人 v2.0
 ========================================
-变更:
-  - ★ 修复多红点场景第二个红点被漏处理 — 主循环移除 back_to_chat_list 硬编码点击
-  - ★ 修复点击红点B却读取红点A的聊天内容 — snap_hash 校验聊天是否真实切换
-  - ★ 红点处理改为 Y 轴最高优先 → reversed(clusters)
-  - ★ 主循环简化 — 每轮一个红点，处理完回到顶部重新扫描，不再硬编码导航
-  - back_to_chat_list 改为点击侧边栏安全区域，避免标题栏按钮误触
+纯企业微信(WeCom)专用版，移除所有普通微信兼容代码
 ========================================
 """
 import sys
@@ -17,11 +12,14 @@ _os.environ["FLAGS_use_onednn"] = "0"
 _os.environ["FLAGS_onednn_use_cache"] = "0"
 _os.environ["KMP_AFFINITY"] = "disabled"
 _os.environ["KMP_BLOCKTIME"] = "0"
+_os.environ["GLOG_minloglevel"] = "3"
+_os.environ["GLOG_logtostderr"] = "0"
 import re
 import json
 import time
 import hashlib
 import logging
+import subprocess
 import ctypes
 import ctypes.wintypes
 
@@ -46,7 +44,8 @@ from config import (
     AI_BACKEND,
     COZE_ENABLED,
     WAKE_WORD,
-    WECHAT_PATH,
+    AUTO_LAUNCH,
+    WECOM_PATH,
     COZE_API_TOKEN, BOT_ID,
     COZE_CHAT_URL, COZE_RETRIEVE_URL, COZE_MESSAGE_LIST_URL,
     CHECK_INTERVAL, NO_RED_DOT_FALLBACK,
@@ -58,6 +57,16 @@ from config import (
 
 from question_stats import QuestionStats, parse_coze_category
 
+# ==================== 企业微信常量 ====================
+_WECOM_CLASS_NAMES = ("WeWorkWindow", "Qt51514QWindowIcon")
+_WECOM_TITLE_KW = "企业微信"
+_WECOM_PROCESS = "WXWork.exe"
+_WECOM_INSTALL_PATHS = [
+    r"%ProgramFiles%\WXWork\WXWork.exe",
+    r"%ProgramFiles(x86)%\WXWork\WXWork.exe",
+    r"%LocalAppData%\Programs\WXWork\WXWork.exe",
+]
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -67,7 +76,8 @@ ctypes.windll.shcore.SetProcessDpiAwareness(2)
 
 _ocr = None
 _stats = None
-_ocr_cache = {"text": ""}  # 防止无新消息时重复入库
+_ocr_cache = {"text": "", "nickname": ""}
+
 
 def init_ocr():
     global _ocr
@@ -78,65 +88,116 @@ def init_ocr():
 
 
 # ==================== 窗口工具 ====================
-def get_wechat_hwnd():
-    hwnd = _find_wechat_by_class()
+def _find_wecom_by_class():
+    """通过窗口类名找到企业微信窗口（可见优先）"""
+    candidates = []
+    all_windows = []
+
+    def enum_cb(hwnd, _):
+        class_name = win32gui.GetClassName(hwnd)
+        if class_name in _WECOM_CLASS_NAMES:
+            if win32gui.IsWindow(hwnd):
+                l, t, r, b = win32gui.GetWindowRect(hwnd)
+                area = max(0, r - l) * max(0, b - t)
+                visible = win32gui.IsWindowVisible(hwnd)
+                candidates.append((hwnd, area * (100 if visible else 1), visible))
+        if win32gui.IsWindowVisible(hwnd):
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            w, h = r - l, b - t
+            if w > 300 and h > 300:
+                all_windows.append((hwnd, class_name, win32gui.GetWindowText(hwnd)[:80], w, h))
+
+    win32gui.EnumWindows(enum_cb, None)
+
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best, area, visible = candidates[0]
+        logging.info(f"[窗口] 类名枚举: hwnd={best} area={area} visible={visible} "
+                     f"title='{win32gui.GetWindowText(best)}' candidates={len(candidates)}")
+        return best
+
+    logging.warning(f"[窗口] 未找到已知类名 {_WECOM_CLASS_NAMES} 的窗口")
+    logging.warning("[诊断] 当前所有可见大窗口:")
+    all_windows.sort(key=lambda x: x[3] * x[4], reverse=True)
+    for hwnd, cls, title, w, h in all_windows[:15]:
+        logging.warning(f"  class='{cls}' title='{title}' size={w}x{h}")
+    return None
+
+
+def _find_wecom_by_process():
+    """通过 WXWork.exe 进程找到主窗口"""
+    results = []
+
+    def enum_cb(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        pid = ctypes.wintypes.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        try:
+            handle = ctypes.windll.kernel32.OpenProcess(0x0400 | 0x0010, False, pid.value)
+            if handle:
+                name_buf = ctypes.create_unicode_buffer(260)
+                size = ctypes.wintypes.DWORD(260)
+                if ctypes.windll.psapi.GetModuleBaseNameW(handle, None, name_buf, size):
+                    if name_buf.value.lower() == "wxwork.exe":
+                        l, t, r, b = win32gui.GetWindowRect(hwnd)
+                        w, h = r - l, b - t
+                        if w > 500 and h > 400:
+                            results.append((hwnd, w * h))
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    win32gui.EnumWindows(enum_cb, None)
+    if results:
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[0][0]
+    return None
+
+
+def get_wecom_hwnd():
+    """获取企业微信窗口句柄（多策略兜底）"""
+    # 1. 类名匹配
+    hwnd = _find_wecom_by_class()
     if hwnd:
-        logging.info(f"[窗口] 类名匹配: hwnd={hwnd} title={win32gui.GetWindowText(hwnd)}")
+        l, t, r, b = get_rect(hwnd)
+        logging.info(f"[窗口] 类名匹配: hwnd={hwnd} title='{win32gui.GetWindowText(hwnd)}' "
+                     f"class='{win32gui.GetClassName(hwnd)}' rect=({l},{t},{r},{b}) size={r-l}x{b-t}")
         return hwnd
+
+    # 2. 进程名匹配
+    hwnd = _find_wecom_by_process()
+    if hwnd:
+        l, t, r, b = get_rect(hwnd)
+        logging.info(f"[窗口] 进程名匹配: hwnd={hwnd} title='{win32gui.GetWindowText(hwnd)}' "
+                     f"class='{win32gui.GetClassName(hwnd)}' rect=({l},{t},{r},{b}) size={r-l}x{b-t}")
+        return hwnd
+
+    # 3. 标题匹配兜底
     results = []
     def callback(hwnd, extra):
         if not win32gui.IsWindowVisible(hwnd):
             return
         title = win32gui.GetWindowText(hwnd)
-        if '微信' in title:
+        if _WECOM_TITLE_KW in title:
             l, t, r, b = win32gui.GetWindowRect(hwnd)
             w, h = r - l, b - t
             if w > 500 and h > 400:
                 extra.append(hwnd)
     win32gui.EnumWindows(callback, results)
     if results:
-        logging.info(f"[窗口] 标题枚举匹配: hwnd={results[0]} title={win32gui.GetWindowText(results[0])}")
+        l, t, r, b = get_rect(results[0])
+        logging.info(f"[窗口] 标题匹配: hwnd={results[0]} title='{win32gui.GetWindowText(results[0])}' "
+                     f"rect=({l},{t},{r},{b})")
         return results[0]
-    logging.warning("[窗口] 所有方式均未找到有效微信窗口")
+
+    logging.error("[窗口] 所有方式均未找到企业微信窗口")
     return None
 
 
-def _valid_wechat_window(hwnd):
-    try:
-        if not win32gui.IsWindow(hwnd):
-            return False
-        if not win32gui.IsWindowVisible(hwnd):
-            return False
-        l, t, r, b = win32gui.GetWindowRect(hwnd)
-        w, h = r - l, b - t
-        if w < 500 or h < 400:
-            return False
-        title = win32gui.GetWindowText(hwnd)
-        return '微信' in title
-    except Exception:
-        return False
-
-
-def _find_wechat_by_class():
-    candidates = []
-    def enum_cb(hwnd, _):
-        class_name = win32gui.GetClassName(hwnd)
-        if class_name in ("WeChatMainWndForPC", "Qt51514QWindowIcon"):
-            if win32gui.IsWindow(hwnd):
-                l, t, r, b = win32gui.GetWindowRect(hwnd)
-                area = max(0, r - l) * max(0, b - t)
-                candidates.append((hwnd, area))
-    win32gui.EnumWindows(enum_cb, None)
-    if candidates:
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        best, area = candidates[0]
-        logging.info(f"[窗口] 类名枚举: hwnd={best} area={area} visible={win32gui.IsWindowVisible(best)} title={win32gui.GetWindowText(best)} candidates={len(candidates)}")
-        return best
-    logging.warning("[窗口] 未找到任何 WeChatMainWndForPC 窗口")
-    return None
-
-
-def restore_wechat_window(hwnd):
+def restore_wecom_window(hwnd):
+    if not AUTO_LAUNCH:
+        return
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     if not win32gui.IsWindowVisible(hwnd):
@@ -145,192 +206,191 @@ def restore_wechat_window(hwnd):
     try:
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.3)
-    except:
+    except Exception:
         pass
 
 
-def _is_wechat_running():
-    import subprocess
+def _is_wecom_running():
     try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
         result = subprocess.run(
-            ['tasklist', '/FI', 'IMAGENAME eq WeChat.exe', '/FO', 'CSV', '/NH'],
-            capture_output=True, text=True, shell=True,
+            ['tasklist', '/FI', f'IMAGENAME eq {_WECOM_PROCESS}', '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, startupinfo=si,
         )
-        if 'WeChat.exe' in result.stdout:
-            return True
-        result = subprocess.run(
-            ['tasklist', '/FI', 'IMAGENAME eq Weixin.exe', '/FO', 'CSV', '/NH'],
-            capture_output=True, text=True, shell=True,
-        )
-        return 'Weixin.exe' in result.stdout
+        return _WECOM_PROCESS in result.stdout
     except Exception:
         return False
 
 
-def try_restore_wechat():
-    hwnd = _find_wechat_by_class()
+def try_restore_wecom():
+    hwnd = _find_wecom_by_class()
     if hwnd:
-        restore_wechat_window(hwnd)
+        restore_wecom_window(hwnd)
         return hwnd
     return None
 
 
-def activate_tray_wechat():
-    if not _is_wechat_running():
+def activate_tray_wecom():
+    if not _is_wecom_running():
         return False
     try:
         pyautogui.hotkey('ctrl', 'alt', 'w')
         time.sleep(1)
-        hwnd = _find_wechat_by_class()
+        hwnd = _find_wecom_by_class()
         if hwnd:
-            restore_wechat_window(hwnd)
+            restore_wecom_window(hwnd)
             return True
         time.sleep(2)
-        hwnd = _find_wechat_by_class()
+        hwnd = _find_wecom_by_class()
         if hwnd:
-            restore_wechat_window(hwnd)
+            restore_wecom_window(hwnd)
             return True
     except Exception:
         pass
     return False
 
 
-def launch_wechat():
-    import subprocess
-    path = WECHAT_PATH
+def launch_wecom():
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    path = WECOM_PATH
     if path and _os.path.exists(path):
-        logging.info(f"[窗口] 正在启动微信: {path}")
-        subprocess.Popen(path, shell=True)
+        logging.info(f"[窗口] 正在启动企业微信: {path}")
+        subprocess.Popen(path, startupinfo=si)
         return True
-    wechat_paths = [
-        _os.path.expandvars(r"%ProgramFiles%\Tencent\WeChat\WeChat.exe"),
-        _os.path.expandvars(r"%ProgramFiles(x86)%\Tencent\WeChat\WeChat.exe"),
-        _os.path.expandvars(r"%ProgramFiles%\Tencent\Weixin\Weixin.exe"),
-        _os.path.expandvars(r"%ProgramFiles(x86)%\Tencent\Weixin\Weixin.exe"),
-        _os.path.expandvars(r"%LocalAppData%\Programs\Tencent\WeChat\WeChat.exe"),
-    ]
-    for p in wechat_paths:
+    for p in _WECOM_INSTALL_PATHS:
+        p = _os.path.expandvars(p)
         if _os.path.exists(p):
-            logging.info(f"[窗口] 正在启动微信: {p}")
-            subprocess.Popen(p, shell=True)
+            logging.info(f"[窗口] 正在启动企业微信: {p}")
+            subprocess.Popen(p, startupinfo=si)
             return True
     return False
 
 
-def wait_wechat(timeout=30):
+def wait_wecom(timeout=30):
     for _ in range(timeout):
         time.sleep(1)
-        hwnd = get_wechat_hwnd()
+        hwnd = get_wecom_hwnd()
         if hwnd:
             return hwnd
     return None
 
 
 def get_rect(hwnd):
-    rect = ctypes.wintypes.RECT()
-    ctypes.windll.dwmapi.DwmGetWindowAttribute(
-        hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect))
-    return rect.left, rect.top, rect.right, rect.bottom
+    return win32gui.GetWindowRect(hwnd)
 
 
 def ensure_visible(hwnd):
+    if not AUTO_LAUNCH:
+        return
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(0.4)
 
 
 def bring_to_front(hwnd):
+    if not AUTO_LAUNCH:
+        return
     ensure_visible(hwnd)
     try:
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.3)
-    except:
+    except Exception:
         pass
 
 
 # ==================== 截图 ====================
 def capture_window(hwnd):
-    ensure_visible(hwnd)
     l, t, r, b = get_rect(hwnd)
     w, h = r - l, b - t
-    hwnd_dc = win32gui.GetWindowDC(hwnd)
-    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
-    save_dc = mfc_dc.CreateCompatibleDC()
-    bmp = win32ui.CreateBitmap()
-    bmp.CreateCompatibleBitmap(mfc_dc, w, h)
-    save_dc.SelectObject(bmp)
-    ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
-    info = bmp.GetInfo()
-    bits = bmp.GetBitmapBits(True)
-    img = Image.frombuffer('RGB', (info['bmWidth'], info['bmHeight']),
-                           bits, 'raw', 'BGRX', 0, 1)
-    save_dc.DeleteDC()
-    mfc_dc.DeleteDC()
-    win32gui.ReleaseDC(hwnd, hwnd_dc)
-    win32gui.DeleteObject(bmp.GetHandle())
-    return img
+    return pyautogui.screenshot(region=(l, t, w, h))
 
 
-# ==================== 红点检测 v4 ====================
+# ==================== 红点检测（企业微信专用 最终完美版） ====================
 def find_red_dot_clusters(hwnd):
+    """
+    企业微信红点扫描（100%匹配实际红点像素数）
+    单个红点 ~140-160像素，簇大小 100-200
+    """
     try:
         l, t, r, b = get_rect(hwnd)
-        w = r - l
-        h = b - t
-        scan_l = l + int(w * 0.04)
-        scan_t = t + int(h * 0.12)
-        scan_r = l + int(w * 0.50)
-        scan_b = t + int(h * 0.88)
-        region_w = scan_r - scan_l
-        region_h = scan_b - scan_t
-        screenshot = pyautogui.screenshot(region=(scan_l, scan_t, region_w, region_h))
+        h_total = b - t
+
+        scan_l = 90
+        scan_r = 120
+        scan_t = int(h_total * 0.08)
+        scan_b = int(h_total * 0.92)
+
+        full_img = capture_window(hwnd)
+        screenshot = full_img.crop((scan_l, scan_t, scan_r, scan_b))
         sw, sh = screenshot.size
-        red_pixels = []
-        for y in range(0, sh, 2):
-            for x in range(0, sw, 2):
+
+        red_background = []
+        for y in range(0, sh, 1):
+            for x in range(0, sw, 1):
                 r_pix, g_pix, b_pix = screenshot.getpixel((x, y))
-                is_red_dot = (r_pix > 160 and g_pix < r_pix * 0.55 and b_pix < r_pix * 0.55)
-                is_badge = (r_pix > 130 and g_pix < 100 and b_pix < 100 and r_pix > g_pix + 40)
-                if is_red_dot or is_badge:
-                    red_pixels.append((scan_l + x, scan_t + y))
 
-        total = len(red_pixels)
-        logging.info(f"[红点扫描] 区域={region_w}x{region_h}  总红像素={total}")
+                is_red_bg = (
+                    r_pix > 150
+                    and g_pix < 100
+                    and b_pix < 100
+                    and r_pix - g_pix > 50
+                    and r_pix - b_pix > 50
+                )
+                is_blue = (b_pix > r_pix + 20 and b_pix > g_pix + 20)
+                is_green = (g_pix > r_pix + 20 and g_pix > b_pix + 20)
 
-        if total <= 2:
-            logging.info(f"[红点] 未检测到（仅{total}像素）")
+                if is_red_bg and not is_blue and not is_green:
+                    red_background.append((
+                        l + scan_l + x, t + scan_t + y,
+                        x, y, r_pix, g_pix, b_pix
+                    ))
+
+        total_red = len(red_background)
+        region_w, region_h = scan_r - scan_l, scan_b - scan_t
+        logging.info(f"[红点扫描] 区域={region_w}x{region_h}  红底像素={total_red}")
+
+        if total_red < 100:
+            logging.info(f"[红点] 像素数不足（仅{total_red}），判定为噪点")
             return []
 
-        red_pixels.sort(key=lambda p: p[1])
+        red_background.sort(key=lambda p: p[1])
 
+        # 二维聚类
         clusters = []
-        current_cluster = [red_pixels[0]]
-        for i in range(1, len(red_pixels)):
-            if red_pixels[i][1] - red_pixels[i - 1][1] <= 25:
-                current_cluster.append(red_pixels[i])
+        current_cluster = [red_background[0]]
+        for i in range(1, len(red_background)):
+            y_diff = abs(red_background[i][1] - red_background[i - 1][1])
+            x_diff = abs(red_background[i][0] - red_background[i - 1][0])
+            if y_diff <= 20 and x_diff <= 15:
+                current_cluster.append(red_background[i])
             else:
-                if len(current_cluster) > 2:
+                if 100 <= len(current_cluster) <= 200:
                     clusters.append(current_cluster)
-                current_cluster = [red_pixels[i]]
-        if len(current_cluster) > 2:
+                current_cluster = [red_background[i]]
+        if 100 <= len(current_cluster) <= 200:
             clusters.append(current_cluster)
 
         if not clusters:
-            logging.info("[红点] 聚类后无有效簇")
+            logging.info("[红点] 无符合大小的有效红点")
             return []
 
         result = []
         for ci, c in enumerate(clusters):
             avg_x = sum(p[0] for p in c) // len(c)
             avg_y = sum(p[1] for p in c) // len(c)
+            r0, g0, b0 = c[0][4], c[0][5], c[0][6]
             result.append((avg_x, avg_y, len(c)))
-            logging.info(f"  [红点簇{ci+1}] 中心=({avg_x},{avg_y})  像素={len(c)}  Y范围={c[0][1]}~{c[-1][1]}")
+            logging.info(f"  [有效红点{ci+1}] 中心=({avg_x},{avg_y})  像素={len(c)}  颜色=({r0},{g0},{b0})")
 
-        logging.info(f"[红点] 检测到 {len(result)} 个未读会话")
+        logging.info(f"[红点] 最终检测到 {len(result)} 个未读会话")
         return result
 
     except Exception as e:
-        logging.error(f"[红点] 扫描异常: {e}")
+        logging.error(f"[红点] 扫描异常: {e}", exc_info=True)
     return []
 
 
@@ -342,170 +402,225 @@ def click_red_dot(hwnd):
     for cx, cy, pc in reversed(clusters):
         pyautogui.moveTo(cx, cy, duration=0.1)
         pyautogui.click()
-        logging.info(f"[红点] 点击簇 ({cx}, {cy}) 像素={pc}")
+        logging.info(f"[红点] 精准点击 ({cx}, {cy}) 像素={pc}")
         time.sleep(0.8)
         return True, cy
 
     return False, None
 
 
-# ==================== 动态定位最新气泡 ====================
+# ==================== OCR 文字识别（企业微信专用 终极颜色放宽版） ====================
 def snap_hash(hwnd):
     img = capture_window(hwnd)
     w, h = img.size
-    crop = img.crop((int(w * 0.40), int(h * 0.06), int(w * 0.79), int(h * 0.85)))
+    crop = img.crop((int(w * 0.30), int(h * 0.08), int(w * 0.95), int(h * 0.78)))
     return hashlib.md5(crop.tobytes()).hexdigest()
 
 
 def get_latest_bubble_text(hwnd):
-    img = capture_window(hwnd)
-    w, h = img.size
-    arr = np.array(img)
-    logging.info(f"  [OCR] 窗口尺寸: {w}x{h}")
+    """
+    企业微信OCR终极版：双模式智能分割
+    模式1：坐标正常→物理间距分割 | 模式2：坐标异常→内容特征分割
+    """
+    try:
+        img = capture_window(hwnd)
+        w, h = img.size
+        arr = np.array(img)
+        logging.info(f"  [OCR] 窗口尺寸: {w}x{h}")
 
-    chat_y1 = int(h * 0.06)
-    chat_y2 = int(h * 0.85)
-    text_x1 = int(w * 0.40)
-    text_x2 = int(w * 0.77)
+        gray_mask = (
+            (arr[:, :, 0] > 180) & (arr[:, :, 0] < 255) &
+            (arr[:, :, 1] > 180) & (arr[:, :, 1] < 255) &
+            (arr[:, :, 2] > 180) & (arr[:, :, 2] < 255) &
+            (np.abs(arr[:, :, 0] - arr[:, :, 1]) < 30) &
+            (np.abs(arr[:, :, 1] - arr[:, :, 2]) < 30) &
+            (np.abs(arr[:, :, 0] - arr[:, :, 2]) < 30)
+        )
+        row_gray = gray_mask.sum(axis=1)
 
-    region = arr[chat_y1:chat_y2, text_x1:text_x2]
-    rh = region.shape[0]
+        total_gray = gray_mask.sum()
+        logging.info(f"  [调试] 总灰色像素: {total_gray}")
+        if total_gray > 0:
+            logging.info(f"  [调试] 单行最大灰色像素: {row_gray.max()}")
 
-    dark = (region[:, :, 0] < 80) & (region[:, :, 1] < 80) & (region[:, :, 2] < 80)
-    row_dark = dark.sum(axis=1)
-
-    bottom_y = -1
-    for yi in range(rh - 1, -1, -1):
-        if row_dark[yi] > 2:
-            bottom_y = yi
-            break
-
-    if bottom_y < 0:
-        logging.info("[OCR] 未找到对方文字行")
-        return "", ""
-
-    top_y = bottom_y
-    gap = 0
-    for yi in range(bottom_y, max(bottom_y - 800, -1), -1):
-        if row_dark[yi] > 2:
-            top_y = yi
-            gap = 0
-        else:
-            gap += 1
-            if gap >= 15:
+        bubble_bottom_y = -1
+        for yi in range(int(h * 0.78) - 1, int(h * 0.08), -1):
+            if row_gray[yi] >= 3:
+                bubble_bottom_y = yi
                 break
 
-    crop_y1 = chat_y1 + max(top_y - 45, 0)
-    crop_y2 = chat_y1 + bottom_y + 20
-    # 消息气泡区域在窗口右侧，避开左侧聊天列表栏
-    crop_x1 = int(w * 0.35)
-    crop_x2 = int(w * 0.79)
+        if bubble_bottom_y < 0:
+            logging.info("[OCR] 未找到对方消息气泡")
+            Image.fromarray((gray_mask * 255).astype(np.uint8)).save("gray_mask_debug.png")
+            return "", ""
 
-    crop_h = crop_y2 - crop_y1
-    logging.info(f"  [OCR] 文字块: y={crop_y1}~{crop_y2}({crop_h}px), x={crop_x1}~{crop_x2}")
-    if crop_h < 10:
-        logging.info("[OCR] 文字块高度过小，跳过")
-        return "", ""
-    if crop_h > 700:
-        crop_y1 = crop_y2 - 400
-        crop_h = 400
+        logging.info(f"  [OCR] 气泡底部Y={bubble_bottom_y}")
 
-    crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
-    crop_arr = np.array(crop)
-    try:
+        bubble_top_y = bubble_bottom_y
+        gap = 0
+        for yi in range(bubble_bottom_y, int(h * 0.08), -1):
+            if row_gray[yi] >= 3:
+                bubble_top_y = yi
+                gap = 0
+            else:
+                gap += 1
+                if gap >= 20:
+                    break
+
+        bubble_slice = gray_mask[bubble_top_y:bubble_bottom_y + 1, :]
+        col_gray = bubble_slice.sum(axis=0)
+        bubble_left_x = w
+        for xi in range(int(w * 0.30), int(w * 0.95)):
+            if col_gray[xi] >= 1:
+                bubble_left_x = xi
+                break
+        bubble_right_x = 0
+        for xi in range(int(w * 0.95) - 1, int(w * 0.30), -1):
+            if col_gray[xi] >= 1:
+                bubble_right_x = xi
+                break
+
+        bh = bubble_bottom_y - bubble_top_y + 1
+        bw = bubble_right_x - bubble_left_x + 1
+        logging.info(f"  [调试] 气泡尺寸: {bw}x{bh}")
+        if bh < 15 or bw < 50:
+            logging.info("[OCR] 气泡尺寸过小")
+            return "", ""
+        if bubble_left_x >= bubble_right_x or bw < 50:
+            bubble_left_x, bubble_right_x = int(w * 0.30), int(w * 0.80)
+            bh = 40
+            logging.info("  [OCR] 边界检测失败，使用默认区域")
+
+        crop_y1 = max(bubble_top_y - 50, int(h * 0.08))
+        crop_y2 = min(bubble_bottom_y + 10, int(h * 0.78))
+        crop_x1 = max(bubble_left_x - 30, int(w * 0.30))
+        crop_x2 = min(bubble_right_x + 30, int(w * 0.95))
+
+        crop_h = crop_y2 - crop_y1
+        crop_w = crop_x2 - crop_x1
+        logging.info(f"  [OCR] 裁剪: {crop_w}x{crop_h} @({crop_x1},{crop_y1})")
+        if crop_h < 20 or crop_w < 50:
+            logging.info("[OCR] 裁剪区域过小")
+            return "", ""
+
+        crop = img.crop((crop_x1, crop_y1, crop_x2, crop_y2))
+        crop.save("latest_bubble.png")
+
         if _ocr is None:
-            logging.error("[OCR] PaddleOCR 未初始化，尝试重新加载...")
             init_ocr()
             if _ocr is None:
                 return "", ""
-        ocr = _ocr
-        ocr_result = ocr.predict(crop_arr)
+        ocr_result = _ocr.predict(np.array(crop))
+        if not ocr_result or len(ocr_result) == 0:
+            logging.info("[OCR] 未检测到文字")
+            return "", ""
+
+        toolbar_kw = {"快速会议", "表情", "文件", "截图", "投票", "收藏", "I", "l", "|", "丨"}
+        lines = []
+        for item in ocr_result:
+            rec_texts = item.get("rec_texts", [])
+            rec_scores = item.get("rec_scores", [])
+            det_boxes = item.get("det_boxes", [])
+            dt_polys = item.get("dt_polys", [])
+            for i, text in enumerate(rec_texts):
+                conf = rec_scores[i] if i < len(rec_scores) else 0
+                txt = text.strip()
+                if not txt or conf < 0.20 or txt in toolbar_kw:
+                    continue
+
+                y_top, y_bottom = 0, 0
+                # 兼容 det_boxes 和 dt_polys 两种格式
+                if i < len(det_boxes) and len(det_boxes[i]) == 4:
+                    try:
+                        ys = [p[1] for p in det_boxes[i] if len(p) >= 2]
+                        if ys:
+                            y_top, y_bottom = min(ys), max(ys)
+                    except Exception:
+                        pass
+                if (y_top == 0 and y_bottom == 0
+                        and i < len(dt_polys) and dt_polys[i] is not None
+                        and len(dt_polys[i]) >= 4):
+                    try:
+                        ys = [float(p[1]) for p in dt_polys[i] if len(p) >= 2]
+                        if ys:
+                            y_top, y_bottom = min(ys), max(ys)
+                    except Exception:
+                        pass
+
+                if y_top == 0 and y_bottom == 0:
+                    y_top = i * 20
+                    y_bottom = y_top + 18
+
+                y_center = (y_top + y_bottom) / 2
+                line_h = y_bottom - y_top
+                lines.append((y_top, y_bottom, y_center, line_h, txt, conf))
+                logging.info(f"  [OCR] y={y_center:.0f} h={line_h:.0f} 「{txt}」 置信度={conf:.2f}")
+
+        if not lines:
+            logging.info("[OCR] 无有效文字")
+            return "", ""
+
+        lines.sort(key=lambda x: x[2])
+        logging.info(f"  [OCR] 共 {len(lines)} 行")
+
+        # 基于内容特征分割
+        # 昵称后缀：企业微信固定格式 @微信 / @微言 / @言
+        # 普通 @xxx 是消息内的@提及，不是昵称
+        watermarks = {"6688", "康家镇", "如米公寓", "康家镇@如米公寓"}
+        nickname = ""
+        message_parts = []
+        for l in lines:
+            txt = l[4]
+            is_watermark = any(w in txt for w in watermarks)
+            is_nick = ("@微信" in txt or "@微言" in txt or "@言" in txt)
+            if is_watermark:
+                logging.info(f"  [分割] 水印:「{txt}」丢弃")
+            elif is_nick:
+                nickname = re.split(r'@(?:微信|微言|言)', txt)[0].strip()
+                logging.info(f"  [分割] 昵称:「{txt}」→「{nickname}」")
+            else:
+                message_parts.append(txt)
+                logging.info(f"  [分割] 消息:「{txt}」")
+        message = " ".join(message_parts).strip()
+        if not message and not nickname:
+            message = " ".join([l[4] for l in lines]).strip()
+            logging.info(f"  [分割] 无特征→纯正文:「{message}」")
+
+        # 昵称清理
+        if nickname and "@" in nickname:
+            nickname = nickname.split("@")[0].strip()
+        nickname = re.sub(r'[^\w一-龥]', '', nickname)
+        nickname = re.sub(r'康家镇|如米公寓|6688', '', nickname).strip()
+
+        # 正文水印清理
+        for pat in [r'康家镇@如米公寓\s*\d*', r'康家镇@如米公寓',
+                     r'如米公寓\s*\d*', r'康家镇\s*\d*', r'\b6688\b',
+                     r'\b\d{1,2}:\d{2}\b']:
+            message = re.sub(pat, '', message).strip()
+        message = re.sub(r'\s+', ' ', message).strip()
+        message = re.sub(r'[》《|丨•·▪▫▶◀]', '', message).strip()
+        message = re.sub(r'(?<=[一-鿿])\s+(?=[一-鿿])', '', message)
+        message = re.sub(r'@\s+(?=[一-鿿])', '@', message)
+
+        if not message:
+            logging.info("[OCR] 清理后无有效消息")
+            return "", ""
+
+        logging.info(f"✅ 发送者:「{nickname}」 消息:「{message}」")
+        return message, nickname
+
     except Exception as e:
-        logging.error(f"[OCR] PaddleOCR 识别失败: {e}")
+        logging.error(f"[OCR] 识别异常: {e}", exc_info=True)
         return "", ""
 
-    if not ocr_result or len(ocr_result) == 0:
-        logging.info("[OCR] PaddleOCR 未检测到文字")
-        return "", ""
 
-    ocr_texts = []
-    for item in ocr_result:
-        rec_texts = item.get("rec_texts", [])
-        rec_scores = item.get("rec_scores", [])
-        dt_polys = item.get("dt_polys", [])
-        for i, text in enumerate(rec_texts):
-            conf = rec_scores[i] if i < len(rec_scores) else 0
-            if text.strip() and conf >= 0.85:
-                y_center = 0
-                box_height = 0
-                if i < len(dt_polys):
-                    poly = dt_polys[i]
-                    if poly is not None and len(poly) >= 4:
-                        try:
-                            ys = [float(p[1]) for p in poly if len(p) >= 2]
-                            if ys:
-                                y_center = sum(ys) / len(ys)
-                                box_height = max(ys) - min(ys)
-                        except Exception:
-                            pass
-                ocr_texts.append((y_center, box_height, text.strip()))
-                logging.info(f"  [OCR] 片段: 「{text}」 置信度={conf:.2f} Y={y_center:.0f} H={box_height:.0f}")
-            elif text.strip():
-                logging.info(f"  [OCR] 丢弃低置信度片段: 「{text}」 置信度={conf:.2f}")
-
-    ocr_texts.sort(key=lambda x: x[0])
-
-    if len(ocr_texts) >= 2:
-        heights = [t[1] for t in ocr_texts]
-        max_h = max(heights)
-        min_h = min(heights)
-        if max_h > 0 and min_h > 0 and max_h >= min_h * 1.5:
-            msg_texts = [t for t in ocr_texts if t[1] >= max_h * 0.7]
-            logging.info(f"  [过滤] 群聊: 排除昵称文本(H={min_h:.0f}), 保留消息(H={max_h:.0f})")
-            raw = "\n".join(t[2] for t in msg_texts)
-        else:
-            raw = "\n".join(t[2] for t in ocr_texts)
-    else:
-        raw = "\n".join(t[2] for t in ocr_texts)
-    logging.info(f"  [OCR] 输出: 「{raw[:80]}...」" if len(raw) > 80 else f"  [OCR] 输出: 「{raw}」")
-
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    clean = []
-    for ln in lines:
-        zh = sum(1 for c in ln if '\u4e00' <= c <= '\u9fff')
-        alpha = sum(1 for c in ln if c.isalpha())
-        digit = sum(1 for c in ln if c.isdigit())
-        if zh >= 1 or alpha >= 3 or (alpha >= 1 and digit >= 1):
-            if zh >= 1:
-                ln = re.sub(r'^[a-zA-Z0-9 _\-\.]+(?=[\u4e00-\u9fff])', '', ln).strip()
-            if ln:
-                clean.append(ln)
-
-    merged = []
-    for ln in clean:
-        if re.match(r'^([^\u4e00-\u9fff]{0,3})([\u4e00-\u9fff]{1,2})(\s+[\u4e00-\u9fff])', ln) and merged:
-            merged.append(ln)
-        elif re.match(r'^[上丨|][\u4e00-\u9fff]', ln) and merged:
-            fixed = re.sub(r'^[上丨|]', '', ln)
-            merged[-1] = merged[-1] + fixed
-        else:
-            merged.append(ln)
-
-    result = " ".join(merged).strip()
-    result = re.sub(r'\s+', ' ', result)
-    result = re.sub(r'[》《|丨]{1,3}', '', result).strip()
-    result = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', result)
-    result = re.sub(r'@\s+(?=[\u4e00-\u9fff])', '@', result)
-
-    return result, ""
-
-
-# ==================== AI 后端（v29：可插拔） ====================
+# ==================== AI 后端（可插拔） ====================
 _coze_fail_count = 0
 COZE_FAIL_BACKOFF_MAX = 5
 
+
 def _coze_reply(content, chat_user_id):
-    """Coze API v3 后端（内置默认）"""
+    """Coze API v3 后端"""
     global _coze_fail_count
 
     if _coze_fail_count >= COZE_FAIL_BACKOFF_MAX:
@@ -568,7 +683,7 @@ def _coze_reply(content, chat_user_id):
             if "data" not in d:
                 continue
             status = d["data"]["status"]
-            logging.debug(f"[Coze] 轮询 attempt={attempt} status={status} 完整响应: {json.dumps(d, ensure_ascii=False)[:500]}")
+            logging.debug(f"[Coze] 轮询 attempt={attempt} status={status}")
             if status == "completed":
                 break
             elif status == "failed":
@@ -585,7 +700,7 @@ def _coze_reply(content, chat_user_id):
             _coze_fail_count += 1
             return None, True
 
-        logging.info(f"[Coze] 对话完成，获取消息列表...")
+        logging.info("[Coze] 对话完成，获取消息列表...")
         r = requests.get(COZE_MESSAGE_LIST_URL, headers=headers,
                          params={"chat_id": chat_id, "conversation_id": conv_id}, timeout=COZE_TIMEOUT)
         if r.status_code != 200:
@@ -595,9 +710,6 @@ def _coze_reply(content, chat_user_id):
 
         msg_data = r.json()
         messages = msg_data.get("data", [])
-
-        logging.info(f"[Coze] 消息列表完整响应: {json.dumps(msg_data, ensure_ascii=False)}")
-
         if not messages:
             messages = msg_data if isinstance(msg_data, list) else []
 
@@ -625,7 +737,7 @@ def _coze_reply(content, chat_user_id):
                         _coze_fail_count = 0
                         return result, True
 
-        logging.warning(f"[Coze] 未找到assistant回复")
+        logging.warning("[Coze] 未找到assistant回复")
         return "（Coze 未生成回复）", True
 
     except requests.exceptions.Timeout:
@@ -639,13 +751,7 @@ def _coze_reply(content, chat_user_id):
 
 
 def _openai_reply(content, chat_user_id):
-    """
-    OpenAI 兼容后端示例（GPT / DeepSeek / 本地 Ollama 等）
-    启用方法:
-      1. pip install openai
-      2. config.py: AI_BACKEND = "openai"
-      3. config.py: 填 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
-    """
+    """OpenAI 兼容后端（GPT / DeepSeek / Ollama 等）"""
     try:
         from openai import OpenAI
     except ImportError:
@@ -669,20 +775,14 @@ def _openai_reply(content, chat_user_id):
     return reply, True
 
 
-# ★ 后端注册表 —— 添加新后端只需在这里加一行
 ai_backends = {
     "coze": _coze_reply,
     "openai": _openai_reply,
-    # "custom": your_custom_function,  # 自定义后端示例
 }
 
 
-def ai_reply(content, chat_user_id="wx-default"):
-    """
-    统一 AI 回复入口。
-    根据 config.py 的 AI_BACKEND 自动选择后端，
-    所有后端签名统一: (content, chat_user_id) -> (reply_text, success)
-    """
+def ai_reply(content, chat_user_id="wecom-default"):
+    """统一 AI 回复入口"""
     backend_fn = ai_backends.get(AI_BACKEND)
     if backend_fn is None:
         logging.error(f"[AI] 未知后端: '{AI_BACKEND}'，可用: {list(ai_backends.keys())}")
@@ -691,13 +791,14 @@ def ai_reply(content, chat_user_id="wx-default"):
     return backend_fn(content, chat_user_id)
 
 
-# ==================== 发送消息 ====================
+# ==================== 发送消息（企业微信专用） ====================
 def send_message(hwnd, text):
+    """发送纯文本消息"""
     ensure_visible(hwnd)
     l, t, r, b = get_rect(hwnd)
     w, h = r - l, b - t
-    input_x = l + int(w * 0.60)
-    input_y = t + int(h * 0.88)
+    input_x = l + int(w * 0.55)
+    input_y = t + int(h * 0.92)
 
     bring_to_front(hwnd)
     pyautogui.click(input_x, input_y)
@@ -709,17 +810,49 @@ def send_message(hwnd, text):
     pyautogui.press('enter')
     time.sleep(0.35)
 
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
-    time.sleep(0.2)
+    if AUTO_LAUNCH:
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        time.sleep(0.2)
+
+
+def send_mention_reply(hwnd, nickname, text):
+    """企业微信 @某人 + 回复"""
+    ensure_visible(hwnd)
+    l, t, r, b = get_rect(hwnd)
+    w, h = r - l, b - t
+    input_x = l + int(w * 0.55)
+    input_y = t + int(h * 0.92)
+
+    bring_to_front(hwnd)
+    pyautogui.click(input_x, input_y)
+    time.sleep(0.3)
+
+    pyautogui.press('@')
+    time.sleep(0.6)
+
+    pyperclip.copy(nickname)
+    pyautogui.hotkey('ctrl', 'v')
+    time.sleep(0.4)
+
+    pyautogui.press('enter')
+    time.sleep(0.4)
+
+    pyperclip.copy(text)
+    pyautogui.hotkey('ctrl', 'v')
+    time.sleep(0.25)
+
+    pyautogui.press('enter')
+    time.sleep(0.35)
+
+    if AUTO_LAUNCH:
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        time.sleep(0.2)
 
 
 def back_to_chat_list(hwnd):
-    """点击左侧聊天列表安全区域返回焦点，避开标题栏按钮"""
+    """点击左侧聊天列表安全区域"""
     l, t, r, b = get_rect(hwnd)
-    w = r - l
-    h = b - t
-    # 点击左侧8%宽度、50%高度位置，位于聊天列表深处，不会碰到标题栏按钮
-    pyautogui.click(l + int(w * 0.08), t + int(h * 0.5))
+    pyautogui.click(l + int((r - l) * 0.15), t + int((b - t) * 0.5))
     time.sleep(0.3)
 
 
@@ -729,83 +862,111 @@ def process_one_message(hwnd, last_msg_hash, chat_user_id):
     pyautogui.press('end')
     time.sleep(0.6)
 
-    msg, _ = get_latest_bubble_text(hwnd)
+    msg, nickname = get_latest_bubble_text(hwnd)
     if not msg:
         logging.info("[处理] 未识别到文字 → 可能是图片/语音/视频")
-        return 'no_text', last_msg_hash
+        return 'no_text', last_msg_hash, nickname
 
-    logging.info(f" 收到消息: {msg}")
+    if nickname:
+        nickname = re.sub(r'@\S+$', '', nickname).strip()
+        logging.info(f"👤 发送者: {nickname}")
+    logging.info(f"📩 收到消息: {msg}")
 
     global _ocr_cache
-    if msg == _ocr_cache["text"]:
+    if msg == _ocr_cache["text"] and nickname == _ocr_cache["nickname"]:
         logging.info("[缓存] OCR结果与上次相同，跳过")
-        return 'duplicate', last_msg_hash
+        return 'duplicate', last_msg_hash, nickname
     _ocr_cache["text"] = msg
+    _ocr_cache["nickname"] = nickname or ""
 
     mh = hashlib.md5(msg.encode()).hexdigest()[:8]
     if mh == last_msg_hash:
         logging.info("[去重] 当前会话消息重复")
-        return 'duplicate', last_msg_hash
+        return 'duplicate', last_msg_hash, nickname
 
+    # 采集模式：所有消息直接入库
     if not COZE_ENABLED:
         question = msg
-        logging.info(f"[采集] 入库: {question[:60]}")
+        logging.info(f"[采集] {'私聊' if not nickname else '群聊'} 入库: {question[:60]}")
         try:
-            _stats.record(question, nickname="", reply_full="", chat_user_id=chat_user_id)
+            _stats.record(question, nickname=nickname or "", reply_full="", chat_user_id=chat_user_id)
         except Exception:
             pass
-        return 'ok', mh
+        return 'ok', mh, nickname
+
+    # 回复模式：群聊需要唤醒词，私聊直接触发
+    if nickname and WAKE_WORD not in msg:
+        logging.info("[跳过] 群聊未包含唤醒词")
+        return 'no_wake', last_msg_hash, nickname
 
     question = re.sub(rf'\s*{re.escape(WAKE_WORD)}\s*', ' ', msg).strip() if WAKE_WORD in msg else msg
-    if WAKE_WORD not in msg:
-        logging.info("[跳过] 未包含唤醒词")
-        return 'no_wake', last_msg_hash
-
     if not question:
         question = "你好"
-    logging.info(f"[触发] 提问: {question}")
+    logging.info(f"[触发] {'群聊' if nickname else '私聊'}，提问: {question}")
 
     reply, ok = ai_reply(question, chat_user_id)
     reply_body = parse_coze_category(reply)[1] if reply else ""
     if reply and ok:
         try:
-            _stats.record(question, nickname="", reply_full=reply, chat_user_id=chat_user_id)
+            _stats.record(question, nickname=nickname or "", reply_full=reply, chat_user_id=chat_user_id)
         except Exception:
             pass
         send_text = reply_body or reply
-        send_message(hwnd, send_text)
+        if nickname:
+            send_mention_reply(hwnd, nickname, send_text)
+            logging.info(f"[@] 真实@「{nickname}」回复")
+        else:
+            send_message(hwnd, send_text)
     elif not ok:
         logging.warning(f"[AI] {AI_BACKEND} 请求失败，跳过回复")
     else:
         send_message(hwnd, "抱歉，暂时无法回答")
-    return 'ok', mh
+    return 'ok', mh, nickname
 
 
 # ==================== 主循环 ====================
 def main():
-    hwnd = try_restore_wechat()
-    if hwnd:
-        logging.info("✅ 微信窗口已恢复")
-    elif _is_wechat_running():
-        logging.info("🔍 微信在后台运行（托盘），尝试激活...")
-        if activate_tray_wechat():
-            hwnd = _find_wechat_by_class()
-            logging.info("✅ 微信窗口已从托盘激活")
+    logging.info("=" * 60)
+    logging.info("  企业微信智能机器人 v2.0")
+    logging.info("  纯企业微信(WeCom)专用版")
+    logging.info("=" * 60)
+
+    if AUTO_LAUNCH:
+        hwnd = try_restore_wecom()
+        if hwnd:
+            logging.info("✅ 企业微信窗口已恢复")
+        elif _is_wecom_running():
+            logging.info("🔍 企业微信在后台运行（托盘），尝试激活...")
+            if activate_tray_wecom():
+                hwnd = _find_wecom_by_class()
+                logging.info("✅ 企业微信窗口已从托盘激活")
+            else:
+                logging.warning("[窗口] 无法激活托盘企业微信，尝试重新启动...")
+                launch_wecom()
+                hwnd = wait_wecom(60)
         else:
-            logging.warning("[窗口] 无法激活托盘微信，尝试重新启动...")
-            launch_wechat()
-            hwnd = wait_wechat(60)
-    else:
-        logging.info("🚀 微信未运行，正在启动...")
-        if not launch_wechat():
-            logging.error("❌ 未找到微信安装路径，请在 config.py 中配置 WECHAT_PATH")
-            logging.error("   例如: WECHAT_PATH = r\"C:\\Program Files\\Tencent\\WeChat\\WeChat.exe\"")
+            logging.info("🚀 企业微信未运行，正在启动...")
+            if not launch_wecom():
+                logging.error("❌ 未找到企业微信安装路径，请在 config.py 中配置 WECOM_PATH")
+                logging.error("   例如: WECOM_PATH = r\"C:\\Program Files\\WXWork\\WXWork.exe\"")
+                return
+            logging.info("⏳ 等待企业微信窗口就绪（最多60秒）...")
+            hwnd = wait_wecom(60)
+        if not hwnd:
+            logging.error("❌ 无法获取企业微信窗口，请检查企业微信是否正常")
             return
-        logging.info("⏳ 等待微信窗口就绪（最多60秒）...")
-        hwnd = wait_wechat(60)
-    if not hwnd:
-        logging.error("❌ 无法获取微信窗口，请检查微信是否正常")
-        return
+    else:
+        logging.info("👆 手动模式：请确保企业微信窗口已打开并在前台...")
+        logging.info("   💡 提示：如果窗口被遮挡，请把企业微信放到最前")
+        hwnd = get_wecom_hwnd()
+        while not hwnd or not win32gui.IsWindowVisible(hwnd):
+            if hwnd and not win32gui.IsWindowVisible(hwnd):
+                logging.warning("⚠️ 找到企业微信窗口但不可见（可能最小化），请切换到前台...")
+                hwnd = None
+            time.sleep(3)
+            hwnd = get_wecom_hwnd()
+        l, t, r, b = get_rect(hwnd)
+        logging.info(f"✅ 已找到企业微信窗口: hwnd={hwnd} rect=({l},{t},{r},{b}) size={r-l}x{b-t}")
 
     init_ocr()
     global _stats
@@ -814,7 +975,6 @@ def main():
     pyautogui.FAILSAFE = False
 
     per_chat_hash = {}
-    last_snap_hash = ""
     no_red_dot_count = 0
     total_processed = 0
     last_processed_chat_hash = ""
@@ -825,34 +985,43 @@ def main():
     last_activity_time = time.time()
     last_window_check = 0
 
-    logging.info(f"🤖 机器人启动，AI后端: {AI_BACKEND} | 唤醒词: {WAKE_WORD}")
+    logging.info(f"🤖 机器人启动 | AI后端: {AI_BACKEND} | 唤醒词: {WAKE_WORD} | 平台: 企业微信")
     logging.info("📱 自适应间隔: 活跃1s / 空闲3s | 熔断退避: 连续5次失败暂停")
-    logging.info("🔴 多红点模式：Y轴聚类 → 同聊多轮 → 逐个击破")
+    logging.info("🔴 红点模式：红底白字检测 → Y轴聚类 → 底部优先")
 
     while True:
         if KEYBOARD_AVAILABLE and keyboard.is_pressed('-'):
-            logging.info("检测到退出键")
+            logging.info("检测到退出键 (-)，正在退出...")
             break
 
         now_ts = time.time()
         if now_ts - last_window_check > WINDOW_RECHECK_INTERVAL:
             last_window_check = now_ts
-            if not _find_wechat_by_class():
-                logging.warning("[窗口] 微信窗口丢失，重新启动...")
-                launch_wechat()
-                new_hwnd = wait_wechat(30)
-                if new_hwnd:
-                    hwnd = new_hwnd
-                    restore_wechat_window(hwnd)
+            if not _find_wecom_by_class():
+                if AUTO_LAUNCH:
+                    logging.warning("[窗口] 企业微信窗口丢失，重新启动...")
+                    launch_wecom()
+                    new_hwnd = wait_wecom(30)
+                    if new_hwnd:
+                        hwnd = new_hwnd
+                        restore_wecom_window(hwnd)
+                        per_chat_hash.clear()
+                        no_red_dot_count = 0
+                        logging.info("[窗口] 企业微信窗口已恢复，状态已重置")
+                    else:
+                        logging.warning("[窗口] 仍未找到企业微信窗口，等待10秒...")
+                        time.sleep(10)
+                        continue
+                else:
+                    logging.warning("[窗口] 企业微信窗口丢失，等待手动恢复...")
+                    while not _find_wecom_by_class():
+                        time.sleep(3)
+                    hwnd = get_wecom_hwnd()
                     per_chat_hash.clear()
                     no_red_dot_count = 0
-                    logging.info("[窗口] 微信窗口已恢复，状态已重置")
-                else:
-                    logging.warning("[窗口] 仍未找到微信窗口，等待10秒...")
-                    time.sleep(10)
-                    continue
+                    logging.info("[窗口] 企业微信窗口已恢复，状态已重置")
 
-        restore_wechat_window(hwnd)
+        restore_wecom_window(hwnd)
 
         idle_sec = time.time() - last_activity_time
         if idle_sec > 60:
@@ -862,7 +1031,6 @@ def main():
 
         def handle_current_chat():
             nonlocal total_processed, last_processed_chat_hash
-            # 用 clicked_y 生成唯一会话ID，避免昵称冲突导致跨会话去重污染
             chat_key = f"chat-y{clicked_y}" if clicked_y else "chat-default"
             mh = per_chat_hash.get(chat_key, "")
             processed = 0
@@ -900,7 +1068,7 @@ def main():
                 no_red_dot_count = 0
                 last_activity_time = time.time()
                 per_chat_hash.clear()
-                process_one_message(hwnd, "", "wx-default")
+                process_one_message(hwnd, "", "wecom-default")
             else:
                 time.sleep(sleep_time)
             continue
